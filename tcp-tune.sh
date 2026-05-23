@@ -1,11 +1,12 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
 #  tcp-tune.sh  —  TCP 深度调优脚本
-#  Version : 2.1
+#  Version : 2.2
 #  Date    : 2025-05-23
 #  Author  : HexHub AI / DMIT-GREENCLOUD-NEBURST 统一标准
 #
 #  Changelog:
+#    v2.2  扫描 /usr/lib/sysctl.d/ 系统默认值 + 区分「冲突」与「覆盖」
 #    v2.1  符号链接检测 + vm.swappiness 统一 + sysctl.conf 彻底清空
 #    v2.0  冲突检测 + 自动清理 + 分档适配 + 验证输出
 #    v1.0  基础分档 + 写入配置
@@ -13,11 +14,12 @@
 #  Features:
 #    - 四档自适应 (微型/标准/高性能/旗舰) 按内存自动分档
 #    - BBR + fq 拥塞控制 (不可用时自动降级 cubic + fq_codel)
+#    - 扫描 /usr/lib/sysctl.d/*.conf 系统默认值（覆盖提示）
 #    - 扫描 & 自动清理 /etc/sysctl.d/*.conf 和 /etc/sysctl.conf 冲突
 #    - 冲突文件备份到时间戳目录，安全可回滚
 #    - RPS/XPS 多核分发 (单核自动跳过)
 #    - 幂等设计，重复执行安全
-#    - 最终 18 项关键参数验证表格
+#    - 最终 19 项关键参数验证表格
 #
 #  Usage:
 #    curl -fsSL <url>/tcp-tune.sh | bash
@@ -43,7 +45,7 @@ MAIN_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5; exit}')
 [ -z "$MAIN_IFACE" ] && MAIN_IFACE=$(ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1)
 
 echo "════════════════════════════════════════════"
-echo "  TCP 调优 v2.1 — $HOSTNAME"
+echo "  TCP 调优 v2.2 — $HOSTNAME"
 echo "  内存: ${MEM_MB}MB  CPU: ${CPU_CORES}核  内核: $KERNEL_VER"
 echo "  网卡: $MAIN_IFACE  BBR: $HAS_BBR  conntrack: $HAS_CONNTRACK"
 echo "════════════════════════════════════════════"
@@ -89,7 +91,6 @@ for f in /etc/sysctl.d/*.conf; do
     fi
 done
 
-# 检测指向 ../sysctl.conf 的符号链接 (Ubuntu cloud-image 常见)
 for f in /etc/sysctl.d/*.conf; do
     [ ! -L "$f" ] && continue
     LINK_TARGET=$(readlink "$f" 2>/dev/null || true)
@@ -107,6 +108,19 @@ if [ -f /etc/sysctl.conf ]; then
         done
         FOUND_CONFLICT=1
     fi
+fi
+
+# 扫描 /usr/lib/sysctl.d/ 系统默认值（仅提示，不清理）
+if [ -d /usr/lib/sysctl.d ]; then
+    for f in /usr/lib/sysctl.d/*.conf; do
+        [ ! -f "$f" ] && continue
+        if grep -qE "$PATTERN" "$f" 2>/dev/null; then
+            echo "  [系统默认] $f (加载在前，会被 99-tcp-tuning.conf 覆盖)"
+            grep -nE "$PATTERN" "$f" | while read line; do
+                echo "             $line"
+            done
+        fi
+    done
 fi
 
 if [ "$FOUND_CONFLICT" -eq 0 ]; then
@@ -147,7 +161,7 @@ if [ -f /etc/sysctl.conf ]; then
     if grep -qE "$PATTERN" /etc/sysctl.conf 2>/dev/null; then
         NEED_CLEANUP=1
         cp /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf" 2>/dev/null || true
-        echo "# Cleared by tcp-tune.sh v2.1 — see /etc/sysctl.d/99-tcp-tuning.conf" > /etc/sysctl.conf
+        echo "# Cleared by tcp-tune.sh v2.2 — see /etc/sysctl.d/99-tcp-tuning.conf" > /etc/sysctl.conf
         echo "  [已处理] /etc/sysctl.conf -> 已清空"
     fi
 fi
@@ -197,7 +211,7 @@ cat > "$CONF_FILE" << EOF
 # ════════════════════════════════════════════
 #   TCP 深度调优 - $HOSTNAME
 #   档位: $TIER (${MEM_MB}MB) | $(date '+%Y-%m-%d %H:%M:%S')
-#   由 tcp-tune.sh v2.1 自动生成
+#   由 tcp-tune.sh v2.2 自动生成
 # ════════════════════════════════════════════
 
 # ── TIME_WAIT ──────────────────────────────
