@@ -14,10 +14,12 @@
 #     apt install -y wget && wget -qO- https://raw.githubusercontent.com/poiiwe/shells/main/install_remnawave.sh | bash
 # ============================================================
 
-# ── Bootstrap: 确保系统有 curl 或 wget ──
-# 注: 如果通过 "curl | bash" 方式运行而服务器没有 curl,
-#     请先执行: apt install -y curl
-if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+# ── Bootstrap: 检测 curl 命令，缺失则自动安装 ──
+# 本脚本后续安装 Docker 及拉取远程资源均依赖 curl，
+# 如果通过 "curl | bash" 方式执行但服务器没有 curl，
+# 脚本进入 bash 后会先自行安装 curl，确保流程继续。
+if ! command -v curl &>/dev/null; then
+    echo "[INFO] 未检测到 curl 命令，正在安装 curl ..."
     apt update -y && apt install -y curl
 fi
 
