@@ -3,7 +3,23 @@
 # Remnawave Node 一键安装脚本
 # 适用系统: Debian / Ubuntu
 # 功能: 安装 Docker、配置 Docker、部署 remnawave-node
+#
+# 使用方式:
+#   交互式:         bash install_remnawave.sh
+#   传参方式:       bash install_remnawave.sh -s "你的SECRET_KEY"
+#   环境变量方式:   SECRET_KEY="xxx" bash install_remnawave.sh
+#   远程一键执行:
+#     apt install -y curl && curl -fsSL https://raw.githubusercontent.com/poiiwe/shells/main/install_remnawave.sh | bash
+#     或:
+#     apt install -y wget && wget -qO- https://raw.githubusercontent.com/poiiwe/shells/main/install_remnawave.sh | bash
 # ============================================================
+
+# ── Bootstrap: 确保系统有 curl 或 wget ──
+# 注: 如果通过 "curl | bash" 方式运行而服务器没有 curl,
+#     请先执行: apt install -y curl
+if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+    apt update -y && apt install -y curl
+fi
 
 set -euo pipefail
 
@@ -14,20 +30,64 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 step()    { echo -e "${CYAN}━━━ $* ━━━${NC}"; }
 
+usage() {
+    cat <<EOF
+用法: $0 [选项]
+
+选项:
+  -s, --secret <KEY>     直接指定 SECRET_KEY（跳过交互输入）
+  -h, --help             显示此帮助信息
+
+环境变量:
+  SECRET_KEY              通过环境变量传入密钥（优先级低于 -s 参数）
+
+示例:
+  bash $0
+  bash $0 -s "my-secret-key"
+  SECRET_KEY="my-key" bash $0
+EOF
+    exit 0
+}
+
 # ──────────────────────────────────────────────
-# 退出陷阱 —— 任何非零退出时打印提示
+# 解析命令行参数
+# ──────────────────────────────────────────────
+ARGS_SECRET=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -s|--secret)
+            if [[ -z "${2:-}" ]]; then
+                error "-s/--secret 参数需要提供一个值"
+                exit 1
+            fi
+            ARGS_SECRET="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            error "未知参数: $1"
+            usage
+            ;;
+    esac
+done
+
+# ──────────────────────────────────────────────
+# 退出陷阱
 # ──────────────────────────────────────────────
 trap 'warn "脚本意外退出，请检查上方错误信息。"' ERR
 
 # ──────────────────────────────────────────────
-# 1. 检查是否为 root 用户
+# 1. 检查 root
 # ──────────────────────────────────────────────
 step "检查运行权限"
 
@@ -38,7 +98,7 @@ fi
 info "已确认 root 权限"
 
 # ──────────────────────────────────────────────
-# 2. 检查操作系统（仅 Debian / Ubuntu）
+# 2. 检查操作系统
 # ──────────────────────────────────────────────
 step "检查操作系统"
 
@@ -47,6 +107,7 @@ if [[ ! -f /etc/os-release ]]; then
     exit 1
 fi
 
+# shellcheck source=/dev/null
 source /etc/os-release
 
 case "$ID" in
@@ -80,6 +141,7 @@ fi
 step "配置 Docker daemon"
 
 DOCKER_CONFIG="/etc/docker/daemon.json"
+mkdir -p /etc/docker
 
 if [[ -f "$DOCKER_CONFIG" ]]; then
     warn "$DOCKER_CONFIG 已存在，将备份为 daemon.json.bak"
@@ -129,7 +191,6 @@ else
     warn "未找到 docker compose CLI 插件，将在后续通过 'docker compose' 方式运行。"
 fi
 
-# 验证 docker compose 可用
 if docker compose version &>/dev/null; then
     info "Docker Compose 插件可用: $(docker compose version)"
 else
@@ -139,17 +200,25 @@ fi
 
 # ──────────────────────────────────────────────
 # 7. 获取 SECRET_KEY
+#    优先级: 命令行 -s 参数 > 环境变量 SECRET_KEY > 交互输入
 # ──────────────────────────────────────────────
 step "配置 SECRET_KEY"
 
-SECRET_KEY=""
-while [[ -z "$SECRET_KEY" ]]; do
-    echo -n "请输入 SECRET_KEY（不能为空）: "
-    read -r SECRET_KEY
-    if [[ -z "$SECRET_KEY" ]]; then
-        warn "SECRET_KEY 不能为空，请重新输入。"
-    fi
-done
+if [[ -n "$ARGS_SECRET" ]]; then
+    SECRET_KEY="$ARGS_SECRET"
+    info "使用命令行参数传入的 SECRET_KEY"
+elif [[ -n "${SECRET_KEY:-}" ]]; then
+    info "使用环境变量 SECRET_KEY"
+else
+    SECRET_KEY=""
+    while [[ -z "$SECRET_KEY" ]]; do
+        echo -n "请输入 SECRET_KEY（不能为空）: "
+        read -r SECRET_KEY
+        if [[ -z "$SECRET_KEY" ]]; then
+            warn "SECRET_KEY 不能为空，请重新输入。"
+        fi
+    done
+fi
 
 # ──────────────────────────────────────────────
 # 8. 部署 remnawave-node
@@ -159,14 +228,12 @@ step "部署 remnawave-node"
 NODE_DIR="/opt/remnanode"
 mkdir -p "$NODE_DIR"
 
-# 写入 .env
 cat > "$NODE_DIR/.env" <<EOF
 NODE_PORT=9527
 SECRET_KEY="$SECRET_KEY"
 EOF
 info "环境变量文件已创建: $NODE_DIR/.env"
 
-# 写入 docker-compose.yml
 cat > "$NODE_DIR/docker-compose.yml" <<'EOF'
 services:
     remnanode:
@@ -197,4 +264,3 @@ info "remnawave-node 已启动"
 step "容器日志（按 Ctrl+C 退出日志查看）"
 echo ""
 docker compose logs -f -t
-
