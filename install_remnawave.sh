@@ -214,8 +214,7 @@ elif [[ -n "${SECRET_KEY:-}" ]]; then
 else
     SECRET_KEY=""
     while [[ -z "$SECRET_KEY" ]]; do
-        echo -n "请输入 SECRET_KEY（不能为空）: "
-        read -r SECRET_KEY
+        read -r -p "请输入 SECRET_KEY（不能为空）: " SECRET_KEY < /dev/tty
         if [[ -z "$SECRET_KEY" ]]; then
             warn "SECRET_KEY 不能为空，请重新输入。"
         fi
