@@ -358,7 +358,7 @@ fi
 
 if [ "$ASSUME_YES" != "1" ]; then
     echo -ne " ${BOLD}应用以上优化? [Y/n]${RESET} "
-    read -r REPLY
+    read -r REPLY < /dev/tty
     case "$REPLY" in
         [Nn][Oo]|[Nn])
             echo ""
