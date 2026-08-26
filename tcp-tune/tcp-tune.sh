@@ -1,570 +1,801 @@
-#!/bin/bash
-# ═══════════════════════════════════════════════════════════════
-#  tcp-tune.sh  —  TCP 深度调优脚本
-#  Version : 2.5
-#  Date    : 2025-05-28
-#  Author  : HexHub AI
-#
-#  Changelog:
-#    v2.5  集成 CLI 参数: -y/--yes / -d/--dry-run / -n/--no-color / -h/--help
-#    v2.4  人机交互全面优化: 彩色输出 / root检查 / 预览确认 / 回滚指引
-#    v2.3  BBR 深度检测: 自动发现模块 → 自动加载 → 醒目提示修复指引
-#    v2.2  扫描 /usr/lib/sysctl.d/ 系统默认值 + 区分「冲突」与「覆盖」
-#
-#  Usage:
-#    bash tcp-tune.sh             交互模式 (预览后确认再写入)
-#    bash tcp-tune.sh -y          非交互模式 (直接应用, 无人值守)
-#    bash tcp-tune.sh -d          预览模式 (仅查看, 不写入任何配置)
-#    bash tcp-tune.sh -n          无颜色模式 (适合管道/日志重定向)
-#    bash tcp-tune.sh -h          显示帮助
-#
-#  向后兼容 (环境变量):
-#    TCP_TUNE_YES=1 bash tcp-tune.sh
-#    TCP_TUNE_DRY_RUN=1 bash tcp-tune.sh
-# ═══════════════════════════════════════════════════════════════
+#!/usr/bin/env bash
+# tcp-tune.sh - throughput-oriented Linux TCP/qdisc tuning assistant
+# License: MIT
 
-# ─── CLI 参数解析 ─────────────────────────────────────────────
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+VERSION="3.0.0"
+CONFIG_FILE="/etc/sysctl.d/99-tcp-tune.conf"
+MODULE_FILE="/etc/modules-load.d/99-tcp-tune.conf"
+RUNTIME_FILE="/usr/local/libexec/tcp-tune-runtime"
+SERVICE_FILE="/etc/systemd/system/tcp-tune-runtime.service"
+BACKUP_ROOT="/var/backups/tcp-tune"
+
+ACTION=""
+LOCAL_MBPS=""
+SERVER_MBPS=""
+RTT_MS=""
+MEMORY_MIB=""
+PROFILE="streaming"
+CURVE="0.7"
+CURVE_STEP=7
+QDISC_REQUEST="auto"
+QDISC=""
+CC_REQUEST="auto"
+CC=""
+ROLE="host"
+IFACE="auto"
+TUNE_RPS="auto"
+NIC_TUNE=0
+CAKE_RATE_MBPS=""
 ASSUME_YES=0
-DRY_RUN=0
+RESOLVE_CONFLICTS=0
 NO_COLOR=0
 
-show_help() {
-    cat << 'HELP'
+if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
+else
+  C_RESET=""; C_BOLD=""; C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_RED=""
+fi
 
-  tcp-tune.sh — TCP 深度调优脚本  v2.5
+say()  { printf '%s\n' "$*"; }
+info() { printf '%sℹ%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
-  用法:
-    bash tcp-tune.sh                    交互模式 (默认)
-    bash tcp-tune.sh -y                 非交互模式 (跳过确认)
-    bash tcp-tune.sh -d                 预览模式 (只看不改)
-    bash tcp-tune.sh -n                 无颜色输出
-    bash tcp-tune.sh -h                 显示此帮助
+usage() {
+  cat <<'EOF'
+tcp-tune.sh - 交互式 Linux TCP 调优工具
 
-  环境变量 (向后兼容):
-    TCP_TUNE_YES=1     同 -y
-    TCP_TUNE_DRY_RUN=1 同 -d
-    TCP_TUNE_NO_COLOR=1 同 -n
+用法：
+  sudo bash tcp-tune.sh              # 推荐：打开交互式主菜单
+  sudo bash tcp-tune.sh wizard
+  bash tcp-tune.sh preview [参数]
+  sudo bash tcp-tune.sh apply [参数]
+  sudo bash tcp-tune.sh restore [--yes]
+  sudo bash tcp-tune.sh uninstall [--yes]
+  bash tcp-tune.sh status
 
-  示例:
-    bash tcp-tune.sh
-    bash tcp-tune.sh --yes
-    bash tcp-tune.sh --dry-run --no-color | tee tcp-tune.log
+参数：
+  --local-mbps N        本地接入带宽（Mbps）
+  --server-mbps N       服务器端口带宽（Mbps）
+  --rtt-ms N            典型往返延迟（ms）
+  --memory-mib N        用于计算的内存；默认自动检测
+  --profile NAME        balanced | streaming | latency | bulk
+  --qdisc NAME          auto | fq | fq_pie | cake
+  --cc NAME             auto | bbr | cubic
+  --role NAME           host（代理/VPS）| router（转发设备）
+  --interface NAME      出口网卡；默认自动检测
+  --curve N             爬升积极度 0.1-1.0；默认 0.7
+  --cake-rate-mbps N    CAKE 的显式整形速率
+  --rps MODE            auto | on | off
+  --nic-tune            尝试开启 GRO/GSO/TSO 等吞吐型 offload
+  --resolve-conflicts   备份并从 /etc 旧文件移除重复参数
+  --yes                 跳过确认
+  --no-color            禁用颜色
+  -h, --help            显示帮助
 
-  说明:
-    自动检测系统内存/CPU/内核, 四档自适应调优 (微型/标准/高性能/旗舰)
-    深度检测 BBR 可用性, 模块未加载则自动加载, 内核不支持则醒目提示
-    自动扫描并清理 /etc/sysctl.d/ 中的冲突配置
-    幂等设计, 可重复执行, 自动备份冲突文件方便回滚
-
-HELP
+示例：
+  sudo bash tcp-tune.sh apply --local-mbps 1000 --server-mbps 500 \
+    --rtt-ms 180 --profile streaming --qdisc fq --curve 0.8
+EOF
 }
 
-while [ $# -gt 0 ]; do
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 > 0 )); }
+clamp() { local n=$1 lo=$2 hi=$3; ((n < lo)) && n=$lo; ((n > hi)) && n=$hi; printf '%s' "$n"; }
+min() { (( $1 < $2 )) && printf '%s' "$1" || printf '%s' "$2"; }
+
+parse_args() {
+  ACTION="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  while (($#)); do
     case "$1" in
-        -y|--yes|--assume-yes)
-            ASSUME_YES=1
-            shift
-            ;;
-        -d|--dry-run|--dry_run)
-            DRY_RUN=1
-            shift
-            ;;
-        -n|--no-color|--no_color)
-            NO_COLOR=1
-            shift
-            ;;
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        *)
-            echo "未知参数: $1"
-            echo "使用 -h 查看帮助"
-            exit 1
-            ;;
+      --local-mbps)      [[ $# -ge 2 ]] || die "$1 缺少数值"; LOCAL_MBPS=$2; shift 2 ;;
+      --server-mbps)     [[ $# -ge 2 ]] || die "$1 缺少数值"; SERVER_MBPS=$2; shift 2 ;;
+      --rtt-ms)          [[ $# -ge 2 ]] || die "$1 缺少数值"; RTT_MS=$2; shift 2 ;;
+      --memory-mib)      [[ $# -ge 2 ]] || die "$1 缺少数值"; MEMORY_MIB=$2; shift 2 ;;
+      --profile)         [[ $# -ge 2 ]] || die "$1 缺少名称"; PROFILE=$2; shift 2 ;;
+      --qdisc)           [[ $# -ge 2 ]] || die "$1 缺少名称"; QDISC_REQUEST=$2; shift 2 ;;
+      --cc)              [[ $# -ge 2 ]] || die "$1 缺少名称"; CC_REQUEST=$2; shift 2 ;;
+      --role)            [[ $# -ge 2 ]] || die "$1 缺少名称"; ROLE=$2; shift 2 ;;
+      --interface)       [[ $# -ge 2 ]] || die "$1 缺少名称"; IFACE=$2; shift 2 ;;
+      --curve)           [[ $# -ge 2 ]] || die "$1 缺少数值"; CURVE=$2; shift 2 ;;
+      --cake-rate-mbps)  [[ $# -ge 2 ]] || die "$1 缺少数值"; CAKE_RATE_MBPS=$2; shift 2 ;;
+      --rps)             [[ $# -ge 2 ]] || die "$1 缺少模式"; TUNE_RPS=$2; shift 2 ;;
+      --nic-tune)        NIC_TUNE=1; shift ;;
+      --resolve-conflicts) RESOLVE_CONFLICTS=1; shift ;;
+      --yes|-y)          ASSUME_YES=1; shift ;;
+      --no-color)        NO_COLOR=1; C_RESET=""; C_BOLD=""; C_CYAN=""; C_GREEN=""; C_YELLOW=""; C_RED=""; shift ;;
+      -h|--help)         usage; exit 0 ;;
+      *) die "未知参数：$1" ;;
     esac
-done
-
-# 环境变量覆盖 (向后兼容)
-[ "${TCP_TUNE_YES:-0}" = "1" ] && ASSUME_YES=1
-[ "${TCP_TUNE_DRY_RUN:-0}" = "1" ] && DRY_RUN=1
-[ "${TCP_TUNE_NO_COLOR:-0}" = "1" ] && NO_COLOR=1
-
-# ─── 颜色定义 ─────────────────────────────────────────────────
-if [ -t 1 ] && [ "$NO_COLOR" != "1" ]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[1;33m'
-    CYAN='\033[0;36m'
-    BOLD='\033[1m'
-    DIM='\033[2m'
-    RESET='\033[0m'
-else
-    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; RESET=''
-fi
-
-# ─── 辅助函数 ─────────────────────────────────────────────────
-info()  { echo -e " ${CYAN}▶${RESET} $*"; }
-ok()    { echo -e " ${GREEN}✔${RESET} $*"; }
-warn()  { echo -e " ${YELLOW}⚠${RESET} $*"; }
-err()   { echo -e " ${RED}✘${RESET} $*"; }
-header() {
-    echo ""
-    echo -e " ${BOLD}── $1 ────────────────────────────────────────────${RESET}"
-    echo ""
+  done
 }
-section() {
-    echo ""
-    echo -e " ${BOLD}[${2:-*}]${RESET} ${CYAN}$1${RESET}"
+
+require_linux() {
+  [[ "$(uname -s)" == "Linux" ]] || die "仅支持 Linux"
+  [[ -r /proc/meminfo && -d /proc/sys/net/ipv4 ]] || die "当前环境缺少 Linux procfs"
 }
-box() {
-    local color="$1"; shift
-    echo ""
-    echo -e " ${color}┌─────────────────────────────────────────────────────────────┐${RESET}"
-    while [ $# -gt 0 ]; do
-        printf " ${color}│ %-65s │${RESET}\n" "$1"
-        shift
+
+require_root() { (( EUID == 0 )) || die "该操作需要 root：请使用 sudo bash $0 $ACTION ..."; }
+
+detect_memory_mib() {
+  local kb
+  kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)
+  printf '%s' "$((kb / 1024))"
+}
+
+validate_inputs() {
+  local name value
+  for name in LOCAL_MBPS SERVER_MBPS RTT_MS MEMORY_MIB; do
+    value=${!name}
+    is_uint "$value" || die "$name 必须是大于 0 的整数（当前：${value:-空}）"
+  done
+  ((LOCAL_MBPS <= 100000)) || die "本地带宽不能超过 100000 Mbps"
+  ((SERVER_MBPS <= 100000)) || die "服务器带宽不能超过 100000 Mbps"
+  ((RTT_MS <= 10000)) || die "RTT 不能超过 10000 ms"
+  normalize_curve
+  case "$PROFILE" in balanced|streaming|latency|bulk) ;; *) die "未知场景：$PROFILE" ;; esac
+  case "$QDISC_REQUEST" in auto|fq|fq_pie|cake) ;; *) die "未知 qdisc：$QDISC_REQUEST" ;; esac
+  case "$CC_REQUEST" in auto|bbr|cubic) ;; *) die "未知拥塞控制：$CC_REQUEST" ;; esac
+  case "$ROLE" in host|router) ;; *) die "role 必须是 host 或 router" ;; esac
+  case "$TUNE_RPS" in auto|on|off) ;; *) die "rps 必须是 auto、on 或 off" ;; esac
+  [[ -z "$CAKE_RATE_MBPS" ]] || is_uint "$CAKE_RATE_MBPS" || die "cake-rate-mbps 必须是正整数"
+  [[ "$IFACE" == auto || "$IFACE" =~ ^[a-zA-Z0-9_.:@-]+$ ]] || die "网卡名称含有非法字符"
+}
+
+normalize_curve() {
+  case "$CURVE" in
+    0.[1-9]) CURVE_STEP=${CURVE#0.} ;;
+    1.0|1)   CURVE_STEP=10; CURVE="1.0" ;;
+    [1-9])   CURVE_STEP=$CURVE; CURVE="0.$CURVE" ;;
+    10)      CURVE_STEP=10; CURVE="1.0" ;;
+    *) die "curve 必须是 0.1-1.0（也兼容旧写法 1-10）" ;;
+  esac
+}
+
+detect_interface() {
+  if [[ "$IFACE" == auto ]]; then
+    command -v ip >/dev/null 2>&1 || die "自动检测网卡需要 iproute2"
+    IFACE=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    [[ -n "$IFACE" ]] || IFACE=$(ip -6 route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+  fi
+  [[ -n "$IFACE" && -d "/sys/class/net/$IFACE" ]] || die "无法找到出口网卡：${IFACE:-空}"
+  MTU=$(<"/sys/class/net/$IFACE/mtu")
+  is_uint "$MTU" || MTU=1500
+  CPU_COUNT=$(getconf _NPROCESSORS_ONLN 2>/dev/null || say 1)
+  is_uint "$CPU_COUNT" || CPU_COUNT=1
+  RX_QUEUES=$(find "/sys/class/net/$IFACE/queues" -maxdepth 1 -type d -name 'rx-*' 2>/dev/null | wc -l)
+  TX_QUEUES=$(find "/sys/class/net/$IFACE/queues" -maxdepth 1 -type d -name 'tx-*' 2>/dev/null | wc -l)
+  ((RX_QUEUES > 0)) || RX_QUEUES=1
+  ((TX_QUEUES > 0)) || TX_QUEUES=1
+}
+
+prompt_default() {
+  local prompt=$1 default=$2 answer
+  read -r -p "$prompt [$default]: " answer
+  printf '%s' "${answer:-$default}"
+}
+
+choose_option() {
+  local target=$1 prompt=$2 default_index=$3 answer index option label marker
+  shift 3
+  local options=("$@")
+  while true; do
+    say
+    say "${C_BOLD}${prompt}${C_RESET}"
+    for index in "${!options[@]}"; do
+      option=${options[$index]}
+      label=${option#*|}
+      marker=""
+      if [[ $((index + 1)) -eq $default_index ]]; then marker='（默认）'; fi
+      printf '  %d) %s%s\n' "$((index + 1))" "$label" "$marker"
     done
-    echo -e " ${color}└─────────────────────────────────────────────────────────────┘${RESET}"
-    echo ""
-}
-die() {
-    echo ""
-    box "$RED" \
-        "操作中止" \
-        "" \
-        "原因: $1"
-    exit 1
-}
-
-# ─── 运行模式提示 ─────────────────────────────────────────────
-header "系统检查"
-
-MODE_STR="交互模式"
-[ "$DRY_RUN" -eq 1 ] && MODE_STR="${YELLOW}预览模式 (Dry-Run)${RESET}"
-[ "$ASSUME_YES" -eq 1 ] && MODE_STR="${GREEN}非交互模式${RESET}"
-echo -e "  ${DIM}运行模式${RESET}  ${MODE_STR}"
-
-# 检查 root
-if [ "$(id -u)" -ne 0 ]; then
-    die "必须使用 root 权限运行, 请执行: sudo bash tcp-tune.sh"
-fi
-ok "运行身份: root"
-
-# 检查依赖
-for cmd in sysctl modprobe ip awk; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        die "缺少必需命令: $cmd"
+    read -r -p "请选择 [$default_index]: " answer
+    answer=${answer:-$default_index}
+    if [[ "$answer" =~ ^[0-9]+$ ]] && ((answer >= 1 && answer <= ${#options[@]})); then
+      option=${options[$((answer - 1))]}
+      printf -v "$target" '%s' "${option%%|*}"
+      return 0
     fi
-done
-ok "依赖检查通过"
+    warn "请输入 1-${#options[@]}"
+  done
+}
 
-# ─── 环境变量 ──────────────────────────────────────────────────
-CONF_FILE="/etc/sysctl.d/99-tcp-tuning.conf"
-BACKUP_DIR="/etc/sysctl.d/.bak-tcp-tune-$(date +%Y%m%d%H%M%S)"
-HOSTNAME=$(hostname)
+choose_yes_no() {
+  local target=$1 prompt=$2 default=${3:-yes} result
+  if [[ "$default" == yes ]]; then
+    choose_option result "$prompt" 1 'yes|是' 'no|否'
+  else
+    choose_option result "$prompt" 2 'yes|是' 'no|否'
+  fi
+  [[ "$result" == yes ]] && printf -v "$target" '%s' 1 || printf -v "$target" '%s' 0
+}
 
-# ─── Phase 0 — 系统检测 ──────────────────────────────────────
-section "收集系统信息" "1"
+wizard() {
+  require_root
+  say "${C_BOLD}TCP 自适应调优向导 v${VERSION}${C_RESET}"
+  say "直接按回车即可采用推荐值；带宽请填写长期可用值而不是瞬时峰值。"
+  say
+  LOCAL_MBPS=$(prompt_default "本地宽带（Mbps）" "1000")
+  SERVER_MBPS=$(prompt_default "服务器端口（Mbps）" "1000")
+  RTT_MS=$(prompt_default "本地到服务器 RTT（ms）" "150")
+  MEMORY_MIB=$(prompt_default "服务器内存（MiB，0=自动检测）" "0")
+  [[ "$MEMORY_MIB" == "0" ]] && MEMORY_MIB=$(detect_memory_mib)
+  choose_option PROFILE "使用场景" 1 \
+    'streaming|代理、视频与高吞吐（推荐）' \
+    'balanced|综合均衡' \
+    'latency|游戏与低延迟' \
+    'bulk|大文件传输与多连接下载'
+  choose_option ROLE "机器角色" 1 \
+    'host|VPS、代理服务器或普通主机（推荐）' \
+    'router|路由器、网关或转发设备'
+  choose_option QDISC_REQUEST "队列算法" 1 \
+    'auto|自动按场景选择（推荐）' \
+    'fq|FQ：BBR 与单线程吞吐优先' \
+    'fq_pie|FQ-PIE：兼顾吞吐、丢包和延迟' \
+    'cake|CAKE：整形、公平与抗 bufferbloat'
+  choose_option CC_REQUEST "拥塞控制算法" 1 \
+    'auto|自动选择 BBR，失败时使用 Cubic（推荐）' \
+    'bbr|强制 BBR' \
+    'cubic|使用内核 Cubic'
+  CURVE=$(prompt_default "爬升积极度 0.1-1.0" "0.7")
+  IFACE=$(prompt_default "出口网卡（auto=自动）" "auto")
+  choose_option TUNE_RPS "多核网络处理 RPS/RFS" 1 \
+    'auto|单 RX 队列且多核时自动开启（推荐）' \
+    'on|强制开启' \
+    'off|关闭'
+  choose_yes_no NIC_TUNE "开启 GRO/GSO/TSO 等吞吐型网卡 offload？" yes
+  choose_yes_no RESOLVE_CONFLICTS "备份并重写存在冲突的旧 sysctl 文件？" yes
+  if [[ "$QDISC_REQUEST" == cake || ( "$QDISC_REQUEST" == auto && "$ROLE" == router ) ]]; then
+    CAKE_RATE_MBPS=$(prompt_default "CAKE 整形速率（Mbps，0=自动计算）" "0")
+    [[ "$CAKE_RATE_MBPS" == 0 ]] && CAKE_RATE_MBPS=""
+  fi
+  validate_inputs
+  detect_interface
+  calculate
+  preview_config
+  say
+  if confirm "写入并立即应用以上配置？"; then
+    ACTION=apply
+    apply_config
+  else
+    info "未修改系统"
+  fi
+}
 
-MEM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
-CPU_CORES=$(nproc)
-KERNEL_VER=$(uname -r)
+main_menu() {
+  local choice
+  say "${C_BOLD}TCP 性能优化工具 v${VERSION}${C_RESET}"
+  say "纯 Bash · BBR · FQ/FQ-PIE/CAKE · 自动备份与回滚"
+  say
+  say "  1) 开始交互式优化"
+  say "  2) 查看当前网络状态"
+  say "  3) 恢复最近一次备份"
+  say "  4) 卸载本工具配置"
+  say "  5) 显示命令行帮助"
+  say "  0) 退出"
+  say
+  read -r -p "请选择 [1]: " choice
+  choice=${choice:-1}
+  case "$choice" in
+    1) wizard ;;
+    2) status ;;
+    3) ACTION=restore; restore_latest ;;
+    4) ACTION=uninstall; uninstall_config ;;
+    5) usage ;;
+    0) info "已退出" ;;
+    *) die "无效选项：$choice" ;;
+  esac
+}
 
-HAS_CONNTRACK=0
-[ -f /proc/sys/net/netfilter/nf_conntrack_max ] && HAS_CONNTRACK=1
+confirm() {
+  local prompt=$1 answer
+  ((ASSUME_YES)) && return 0
+  [[ -t 0 ]] || die "非交互执行需明确添加 --yes"
+  read -r -p "$prompt [y/N]: " answer
+  [[ "$answer" =~ ^[Yy]$ ]]
+}
 
-# BBR 深度检测
-HAS_BBR=0
-BBR_HINT=""
-BBR_STATUS=""
+cc_available() {
+  local cc=$1 available
+  available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+  [[ " $available " == *" $cc "* ]]
+}
 
-if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
-    HAS_BBR=1
-    BBR_STATUS="${GREEN}可用${RESET}"
-    info "BBR: ${GREEN}可用${RESET}"
-else
-    if modinfo tcp_bbr >/dev/null 2>&1; then
-        info "发现 BBR 内核模块但未加载, 尝试自动加载..."
-        if modprobe tcp_bbr 2>/dev/null && \
-           sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
-            HAS_BBR=1
-            BBR_STATUS="${GREEN}已自动加载模块${RESET}"
-            ok "BBR 模块加载成功!"
-            echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf 2>/dev/null && \
-                info "已写入 /etc/modules-load.d/tcp_bbr.conf (开机自加载)"
-        else
-            BBR_STATUS="${RED}模块加载失败${RESET}"
-            BBR_HINT="内核签名或 Secure Boot 阻止, 尝试: apt install --reinstall linux-image-$(uname -r)"
-            warn "BBR 模块存在但加载失败 (内核签名 / Secure Boot)"
-        fi
+select_congestion_control() {
+  case "$CC_REQUEST" in
+    bbr) CC=bbr ;;
+    cubic) CC=cubic ;;
+    auto)
+      if cc_available bbr; then
+        CC=bbr
+      elif command -v modinfo >/dev/null 2>&1 && modinfo tcp_bbr >/dev/null 2>&1; then
+        CC=bbr
+      else
+        CC=cubic
+      fi
+      ;;
+  esac
+}
+
+select_qdisc() {
+  if [[ "$QDISC_REQUEST" != auto ]]; then
+    QDISC=$QDISC_REQUEST
+  elif [[ "$ROLE" == router ]]; then
+    QDISC=cake
+  elif [[ "$PROFILE" == latency || "$PROFILE" == balanced ]]; then
+    QDISC=fq_pie
+  else
+    QDISC=fq
+  fi
+}
+
+calculate() {
+  local bottleneck factor mem_cap hard_cap profile_backlog
+  bottleneck=$(min "$LOCAL_MBPS" "$SERVER_MBPS")
+  BDP_BYTES=$((bottleneck * RTT_MS * 125))
+
+  case "$PROFILE" in
+    balanced)  factor=$((220 + CURVE_STEP * 18)); profile_backlog=8 ;;
+    streaming) factor=$((280 + CURVE_STEP * 24)); profile_backlog=12 ;;
+    latency)   factor=$((180 + CURVE_STEP * 12)); profile_backlog=6 ;;
+    bulk)      factor=$((350 + CURVE_STEP * 30)); profile_backlog=18 ;;
+  esac
+
+  BUFFER_BYTES=$((BDP_BYTES * factor / 100))
+  mem_cap=$((MEMORY_MIB * 1024 * 1024 / 8))
+  hard_cap=$((1024 * 1024 * 1024))
+  ((mem_cap > hard_cap)) && mem_cap=$hard_cap
+  ((mem_cap < 4 * 1024 * 1024)) && mem_cap=$((4 * 1024 * 1024))
+  BUFFER_BYTES=$(clamp "$BUFFER_BYTES" $((4 * 1024 * 1024)) "$mem_cap")
+
+  BACKLOG=$((bottleneck * profile_backlog))
+  local backlog_cap=65536
+  ((MEMORY_MIB < 1024)) && backlog_cap=8192
+  ((MEMORY_MIB >= 1024 && MEMORY_MIB < 4096)) && backlog_cap=32768
+  BACKLOG=$(clamp "$BACKLOG" 4096 "$backlog_cap")
+  SOMAXCONN=$(clamp "$((BACKLOG / 2))" 4096 32768)
+  NETDEV_BUDGET=$((300 + CURVE_STEP * 150))
+  NETDEV_BUDGET_USECS=$((3000 + CURVE_STEP * 700))
+  FQ_LIMIT=$(clamp "$((BDP_BYTES / MTU * 2 + 4096))" 4096 65536)
+  FQ_FLOW_LIMIT=$((100 + CURVE_STEP * 40))
+  FQ_QUANTUM=$((MTU * 2))
+  FQ_INITIAL_QUANTUM=$((MTU * (8 + CURVE_STEP * 2)))
+  PIE_TARGET_MS=$(clamp "$((RTT_MS * (5 + CURVE_STEP) / 100))" 5 30)
+  QDISC_MEMORY=$((BUFFER_BYTES / 2))
+  QDISC_MEMORY=$(clamp "$QDISC_MEMORY" $((16 * 1024 * 1024)) $((128 * 1024 * 1024)))
+  if [[ -n "$CAKE_RATE_MBPS" ]]; then
+    CAKE_RATE_KBIT=$((CAKE_RATE_MBPS * 1000))
+  else
+    CAKE_RATE_KBIT=$((bottleneck * (940 + CURVE_STEP * 6)))
+  fi
+  RPS_ENTRIES=$(clamp "$((CPU_COUNT * 8192))" 32768 262144)
+  RPS_FLOW_PER_QUEUE=$((RPS_ENTRIES / RX_QUEUES))
+  TCP_LIMIT_OUTPUT_BYTES=$((BDP_BYTES * (5 + CURVE_STEP) / 100))
+  TCP_LIMIT_OUTPUT_BYTES=$(clamp "$TCP_LIMIT_OUTPUT_BYTES" 1048576 16777216)
+  select_congestion_control
+  select_qdisc
+}
+
+human_bytes() {
+  local n=$1
+  if ((n >= 1073741824)); then printf '%d.%02d GiB' "$((n/1073741824))" "$(((n%1073741824)*100/1073741824))"
+  elif ((n >= 1048576)); then printf '%d.%02d MiB' "$((n/1048576))" "$(((n%1048576)*100/1048576))"
+  else printf '%d KiB' "$((n/1024))"; fi
+}
+
+should_enable_rps() {
+  [[ "$TUNE_RPS" == on ]] || [[ "$TUNE_RPS" == auto && "$CPU_COUNT" -gt 1 && "$RX_QUEUES" -le 1 ]]
+}
+
+cpu_mask() {
+  local remaining=$CPU_COUNT rem groups=()
+  rem=$((remaining % 32))
+  if ((rem)); then groups+=("$(printf '%x' "$(((1 << rem) - 1))")"); fi
+  remaining=$((remaining / 32))
+  while ((remaining-- > 0)); do groups+=(ffffffff); done
+  local joined="" group
+  for group in "${groups[@]}"; do joined+="${joined:+,}$group"; done
+  printf '%s' "$joined"
+}
+
+build_qdisc_args() {
+  case "$QDISC" in
+    fq)
+      QDISC_ARGS=(fq limit "$FQ_LIMIT" flow_limit "$FQ_FLOW_LIMIT" quantum "$FQ_QUANTUM" initial_quantum "$FQ_INITIAL_QUANTUM" pacing)
+      ;;
+    fq_pie)
+      # "flows" is intentionally omitted: the kernel only accepts it when a
+      # new FQ-PIE instance is created, not when an existing one is replaced.
+      QDISC_ARGS=(fq_pie limit "$FQ_LIMIT" target "${PIE_TARGET_MS}ms" tupdate "${PIE_TARGET_MS}ms" quantum "$MTU" memory_limit "$QDISC_MEMORY" ecn dq_rate_estimator)
+      ;;
+    cake)
+      QDISC_ARGS=(cake bandwidth "${CAKE_RATE_KBIT}Kbit" besteffort flows nonat nowash no-ack-filter rtt "${RTT_MS}ms")
+      if ((CAKE_RATE_KBIT >= 10000000)); then QDISC_ARGS+=(no-split-gso); fi
+      ;;
+  esac
+}
+
+print_qdisc_command() {
+  local item
+  printf 'tc qdisc replace dev %q root' "$IFACE"
+  for item in "${QDISC_ARGS[@]}"; do printf ' %q' "$item"; done
+  say
+}
+
+emit_config() {
+  cat <<EOF
+# Managed by tcp-tune.sh v${VERSION}
+# Inputs: local=${LOCAL_MBPS}Mbps server=${SERVER_MBPS}Mbps rtt=${RTT_MS}ms memory=${MEMORY_MIB}MiB
+# Profile: ${PROFILE}; climb=${CURVE}; qdisc=${QDISC}; calculated BDP=${BDP_BYTES} bytes
+
+# Queue discipline and congestion control
+EOF
+  emit_setting net.core.default_qdisc "$QDISC"
+  emit_setting net.ipv4.tcp_congestion_control "$CC"
+  say
+  say "# BDP-aware socket ceilings; TCP receive auto-tuning remains enabled"
+  emit_setting net.core.rmem_max "$BUFFER_BYTES"
+  emit_setting net.core.wmem_max "$BUFFER_BYTES"
+  emit_setting net.ipv4.tcp_rmem "4096 131072 $BUFFER_BYTES"
+  emit_setting net.ipv4.tcp_wmem "4096 16384 $BUFFER_BYTES"
+  emit_setting net.ipv4.tcp_moderate_rcvbuf 1
+  emit_setting net.ipv4.tcp_window_scaling 1
+  emit_setting net.ipv4.tcp_limit_output_bytes "$TCP_LIMIT_OUTPUT_BYTES"
+  say
+  say "# Burst and connection queues"
+  emit_setting net.core.netdev_max_backlog "$BACKLOG"
+  emit_setting net.core.netdev_budget "$NETDEV_BUDGET"
+  emit_setting net.core.netdev_budget_usecs "$NETDEV_BUDGET_USECS"
+  emit_setting net.core.somaxconn "$SOMAXCONN"
+  emit_setting net.ipv4.tcp_max_syn_backlog "$SOMAXCONN"
+  if should_enable_rps; then
+    emit_setting net.core.rps_sock_flow_entries "$RPS_ENTRIES"
+  fi
+  say
+  say "# Resilience for tunnels, proxies and long-lived connections"
+  emit_setting net.ipv4.tcp_mtu_probing 1
+  emit_setting net.ipv4.tcp_fastopen 3
+  emit_setting net.ipv4.tcp_keepalive_time 600
+  emit_setting net.ipv4.tcp_keepalive_intvl 30
+  emit_setting net.ipv4.tcp_keepalive_probes 5
+  emit_setting net.ipv4.tcp_fin_timeout 30
+  if [[ "$PROFILE" == streaming || "$PROFILE" == bulk ]]; then
+    emit_setting net.ipv4.tcp_slow_start_after_idle 0
+  fi
+}
+
+emit_setting() {
+  local key=$1 value=$2 proc_path="/proc/sys/${1//./\/}"
+  if [[ -e "$proc_path" ]]; then
+    printf '%s = %s\n' "$key" "$value"
+  else
+    printf '# unsupported by this kernel: %s\n' "$key"
+  fi
+}
+
+preview_config() {
+  build_qdisc_args
+  say
+  say "${C_BOLD}计算结果${C_RESET}"
+  say "  瓶颈带宽 : $(min "$LOCAL_MBPS" "$SERVER_MBPS") Mbps"
+  say "  单流 BDP  : $(human_bytes "$BDP_BYTES")"
+  say "  缓冲上限  : $(human_bytes "$BUFFER_BYTES")（受内存上限保护）"
+  say "  网卡/队列  : $IFACE（MTU $MTU，RX $RX_QUEUES，TX $TX_QUEUES）"
+  say "  CPU/内存   : $CPU_COUNT 核 / ${MEMORY_MIB} MiB"
+  say "  拥塞控制   : $CC"
+  say "  qdisc      : $QDISC"
+  say "  场景/曲线  : $PROFILE / $CURVE"
+  say "  首轮调度量 : $(human_bytes "$FQ_INITIAL_QUANTUM")"
+  should_enable_rps && say "  RPS/RFS     : 启用（$RPS_ENTRIES 流）" || say "  RPS/RFS     : 不启用"
+  [[ "$QDISC" == cake ]] && say "  CAKE 速率   : $CAKE_RATE_KBIT Kbit/s"
+  say
+  say "${C_BOLD}当前网卡将执行${C_RESET}"
+  print_qdisc_command
+  [[ "$QDISC" == cake && "$CAKE_RATE_KBIT" -ge 1000000 ]] && warn "CAKE 会消耗更多单核 CPU；高速 VPS 追求绝对吞吐通常优先 fq。"
+  say
+  emit_config
+}
+
+generated_keys() { emit_config | awk -F= '/^[a-z0-9_.]+[[:space:]]*=/ {gsub(/[[:space:]]/,"",$1); print $1}'; }
+
+find_conflicts() {
+  local key file line
+  CONFLICTS=()
+  while IFS= read -r key; do
+    for file in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
+      [[ -f "$file" && "$file" != "$CONFIG_FILE" ]] || continue
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && CONFLICTS+=("$file:$line")
+      done < <(grep -nE "^[[:space:]]*${key//./\\.}[[:space:]]*=" "$file" 2>/dev/null || true)
+    done
+  done < <(generated_keys)
+}
+
+backup_file() {
+  local source=$1 backup_dir=$2 destination
+  [[ -e "$source" ]] || return 0
+  destination="$backup_dir$source"
+  mkdir -p "$(dirname "$destination")"
+  cp -a "$source" "$destination"
+}
+
+rewrite_conflicts() {
+  local backup_dir=$1 entry file tmp keys_file compact_tmp
+  declare -A touched=()
+  for entry in "${CONFLICTS[@]}"; do touched["${entry%%:*}"]=1; done
+  keys_file=$(mktemp)
+  generated_keys > "$keys_file"
+  for file in "${!touched[@]}"; do
+    backup_file "$file" "$backup_dir"
+    tmp=$(mktemp)
+    compact_tmp=$(mktemp)
+    awk '
+      NR == FNR { managed[$1] = 1; next }
+      {
+        line = $0
+        if (line ~ /^[[:space:]]*[#;]/) { print; next }
+        key = line
+        sub(/[[:space:]]*=.*/, "", key)
+        gsub(/[[:space:]]/, "", key)
+        if (key in managed) next
+        print line
+      }
+    ' "$keys_file" "$file" > "$tmp"
+    awk '
+      /^[[:space:]]*$/ { if (seen) pending_blank = 1; next }
+      { if (pending_blank) print ""; print; seen = 1; pending_blank = 0 }
+    ' "$tmp" > "$compact_tmp"
+    cat "$compact_tmp" > "$file"
+    rm -f "$tmp" "$compact_tmp"
+  done
+  rm -f "$keys_file"
+  ok "已备份旧文件，并移除 ${#CONFLICTS[@]} 条重复参数"
+}
+
+load_network_modules() {
+  command -v modprobe >/dev/null 2>&1 || return 0
+  modprobe "sch_${QDISC}" 2>/dev/null || true
+  [[ "$CC" == bbr ]] && modprobe tcp_bbr 2>/dev/null || true
+}
+
+remember_live_qdisc() {
+  local backup_dir=$1 previous
+  command -v tc >/dev/null 2>&1 || return 0
+  previous=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk '$0 ~ / root / {print $2; exit}')
+  printf '%s\n' "$IFACE" > "$backup_dir/qdisc.iface"
+  printf '%s\n' "${previous:-unknown}" > "$backup_dir/qdisc.kind"
+}
+
+apply_live_qdisc() {
+  command -v tc >/dev/null 2>&1 || { warn "缺少 tc；请安装 iproute2"; return 1; }
+  build_qdisc_args
+  if ! tc qdisc replace dev "$IFACE" root "${QDISC_ARGS[@]}"; then
+    warn "qdisc $QDISC 无法挂载；可能是内核不支持或参数与当前版本不兼容"
+    return 1
+  fi
+  ok "已将 $QDISC 实际挂载到 $IFACE"
+}
+
+apply_rps() {
+  should_enable_rps || return 0
+  local mask queue failures=0
+  mask=$(cpu_mask)
+  for queue in "/sys/class/net/$IFACE/queues"/rx-*; do
+    [[ -d "$queue" ]] || continue
+    printf '%s' "$mask" > "$queue/rps_cpus" 2>/dev/null || failures=$((failures + 1))
+    [[ -w "$queue/rps_flow_cnt" ]] && printf '%s' "$RPS_FLOW_PER_QUEUE" > "$queue/rps_flow_cnt" 2>/dev/null || true
+  done
+  ((failures == 0)) && ok "已配置 RPS/RFS CPU 并行处理" || warn "部分 RPS 队列不允许修改，已跳过"
+}
+
+tune_nic_offloads() {
+  ((NIC_TUNE)) || return 0
+  command -v ethtool >/dev/null 2>&1 || { warn "未安装 ethtool，跳过 NIC offload"; return; }
+  ethtool -K "$IFACE" gro on gso on tso on rx on tx on >/dev/null 2>&1 || warn "网卡不支持修改全部 offload，已保留驱动允许的状态"
+}
+
+write_runtime_helper() {
+  local tc_path qdisc_line="" mask
+  tc_path=$(command -v tc)
+  build_qdisc_args
+  printf -v qdisc_line '%q ' "$tc_path" qdisc replace dev "$IFACE" root "${QDISC_ARGS[@]}"
+  mask=$(cpu_mask)
+  install -d -m 0755 "$(dirname "$RUNTIME_FILE")"
+  {
+    say '#!/bin/sh'
+    say 'set -eu'
+    printf '%s\n' "$qdisc_line"
+    if should_enable_rps; then
+      printf '%s\n' "for q in /sys/class/net/$IFACE/queues/rx-*; do"
+      printf '%s\n' "  [ -d \"\$q\" ] || continue"
+      printf '%s\n' "  printf '%s' '$mask' > \"\$q/rps_cpus\" 2>/dev/null || true"
+      printf '%s\n' "  [ ! -w \"\$q/rps_flow_cnt\" ] || printf '%s' '$RPS_FLOW_PER_QUEUE' > \"\$q/rps_flow_cnt\""
+      say 'done'
+    fi
+    if ((NIC_TUNE)) && command -v ethtool >/dev/null 2>&1; then
+      printf '%q -K %q gro on gso on tso on rx on tx on >/dev/null 2>&1 || true\n' "$(command -v ethtool)" "$IFACE"
+    fi
+  } > "$RUNTIME_FILE"
+  chmod 0755 "$RUNTIME_FILE"
+
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Apply tcp-tune qdisc and queue settings
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$RUNTIME_FILE
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable tcp-tune-runtime.service >/dev/null
+  else
+    warn "未检测到 systemd；高级 qdisc 已立即生效，但重启后只保留 sysctl 默认项"
+  fi
+}
+
+apply_config() {
+  require_root
+  command -v sysctl >/dev/null 2>&1 || die "缺少 sysctl（通常由 procps/procps-ng 提供）"
+  command -v tc >/dev/null 2>&1 || die "缺少 tc；请安装 iproute2"
+
+  detect_interface
+  calculate
+  load_network_modules
+  select_congestion_control
+  calculate
+  find_conflicts
+
+  local timestamp backup_dir tmp
+  timestamp=$(date +%Y%m%d-%H%M%S)
+  backup_dir="$BACKUP_ROOT/$timestamp"
+  mkdir -p "$backup_dir"
+  backup_file "$CONFIG_FILE" "$backup_dir"
+  backup_file "$MODULE_FILE" "$backup_dir"
+  backup_file "$RUNTIME_FILE" "$backup_dir"
+  backup_file "$SERVICE_FILE" "$backup_dir"
+  remember_live_qdisc "$backup_dir"
+
+  if ((${#CONFLICTS[@]})); then
+    warn "发现 ${#CONFLICTS[@]} 条旧配置与本工具重复："
+    printf '  %s\n' "${CONFLICTS[@]}" >&2
+    if ((RESOLVE_CONFLICTS)); then
+      rewrite_conflicts "$backup_dir"
     else
-        BBR_STATUS="${RED}不支持${RESET}"
-        echo ""
-        box "$YELLOW" \
-            "当前内核 (${KERNEL_VER}) 未包含 tcp_bbr 模块" \
-            "" \
-            "建议启用 BBR 以提升 TCP 性能 (延迟 ↓ 20-40%, 吞吐 ↑ 2-10x)" \
-            "" \
-            "  方案1: apt update && apt install -y linux-image-cloud-amd64 && reboot" \
-            "  方案2: wget -O tcp.sh https://git.io/bbr.sh && bash tcp.sh" \
-            "  方案3: 升级至 Debian 10+ / Ubuntu 18.04+ / CentOS 8+"
-        BBR_HINT="内核不含 BBR 模块, 建议升级内核后重试"
+      warn "暂不改动旧文件；若 /etc/sysctl.conf 中存在重复项，它可能覆盖本配置。"
+      warn "可重新执行并添加 --resolve-conflicts。"
     fi
-fi
+  fi
 
-MAIN_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5; exit}')
-[ -z "$MAIN_IFACE" ] && MAIN_IFACE=$(ls /sys/class/net/ 2>/dev/null | grep -v lo | head -1)
+  tmp=$(mktemp)
+  emit_config > "$tmp"
+  install -D -m 0644 "$tmp" "$CONFIG_FILE"
+  rm -f "$tmp"
+  install -d -m 0755 "$(dirname "$MODULE_FILE")"
+  : > "$MODULE_FILE"
+  if [[ "$CC" == bbr ]]; then
+    printf '%s\n' tcp_bbr > "$MODULE_FILE"
+  fi
+  printf '%s\n' "sch_$QDISC" >> "$MODULE_FILE"
 
-CONNTRACK_STR=$([ "$HAS_CONNTRACK" -eq 1 ] && echo "${GREEN}可用${RESET}" || echo "${DIM}不可用${RESET}")
+  if ! sysctl -p "$CONFIG_FILE"; then
+    warn "应用失败，正在恢复本次修改前的配置"
+    restore_from "$backup_dir"
+    die "内核拒绝了部分参数；系统已回滚"
+  fi
+  if ! apply_live_qdisc; then
+    restore_from "$backup_dir"
+    die "qdisc 应用失败；系统已回滚"
+  fi
+  apply_rps
+  tune_nic_offloads
+  write_runtime_helper
+  printf '%s\n' "$backup_dir" > "$BACKUP_ROOT/latest"
+  ok "配置已应用：$CONFIG_FILE"
+  info "当前算法：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)，qdisc：$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+}
 
-echo ""
-echo -e "  ${DIM}系统${RESET}    ${BOLD}${HOSTNAME}${RESET}"
-echo -e "  ${DIM}内存${RESET}    ${MEM_MB}MB  |  ${DIM}CPU${RESET}    ${CPU_CORES}核  |  ${DIM}内核${RESET}    ${KERNEL_VER}"
-echo -e "  ${DIM}网卡${RESET}    ${MAIN_IFACE}  |  ${DIM}BBR${RESET}    ${BBR_STATUS}  |  ${DIM}连接追踪${RESET}    ${CONNTRACK_STR}"
-
-# ─── Phase 1 — 冲突检测 ──────────────────────────────────────
-section "扫描现有配置冲突" "2"
-
-OUR_KEYS=(
-    net.ipv4.tcp_tw_reuse net.ipv4.tcp_max_tw_buckets
-    net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes
-    net.ipv4.tcp_syncookies net.ipv4.tcp_syn_retries net.ipv4.tcp_synack_retries
-    net.ipv4.tcp_max_syn_backlog net.core.somaxconn
-    net.ipv4.ip_local_port_range net.ipv4.tcp_mtu_probing
-    net.core.rmem_default net.core.wmem_default net.core.rmem_max net.core.wmem_max
-    net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_mem
-    net.core.netdev_max_backlog net.ipv4.tcp_fastopen
-    net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_sack
-    net.ipv4.tcp_timestamps net.ipv4.tcp_window_scaling net.ipv4.tcp_no_metrics_save
-    net.ipv4.tcp_notsent_lowat net.ipv4.tcp_fin_timeout
-    net.ipv4.tcp_rfc1337 net.ipv4.tcp_retries2 net.core.optmem_max
-    fs.file-max net.core.default_qdisc net.ipv4.tcp_congestion_control
-    net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_tcp_timeout_established
-    vm.swappiness
-)
-
-PATTERN=$(printf '%s|' "${OUR_KEYS[@]}" | sed 's/|$//')
-FOUND_CONFLICT=0
-CONFLICT_FILES=()
-
-for f in /etc/sysctl.d/*.conf; do
-    [ ! -f "$f" ] && continue
-    [ "$(basename "$f")" = "$(basename "$CONF_FILE")" ] && continue
-    if grep -qE "$PATTERN" "$f" 2>/dev/null; then
-        echo -e "  ${YELLOW}✗${RESET} $f"
-        grep -nE "$PATTERN" "$f" | while read line; do echo "      $line"; done
-        FOUND_CONFLICT=1
-        CONFLICT_FILES+=("$f")
+restore_from() {
+  local backup_dir=$1 path old_iface old_kind
+  for path in "$CONFIG_FILE" "$MODULE_FILE" "$RUNTIME_FILE" "$SERVICE_FILE"; do
+    if [[ -e "$backup_dir$path" ]]; then
+      cp -a "$backup_dir$path" "$path"
+    else
+      rm -f "$path"
     fi
-done
-
-for f in /etc/sysctl.d/*.conf; do
-    [ ! -L "$f" ] && continue
-    LINK_TARGET=$(readlink "$f" 2>/dev/null || true)
-    if [ "$LINK_TARGET" = "../sysctl.conf" ] || [ "$LINK_TARGET" = "/etc/sysctl.conf" ]; then
-        echo -e "  ${YELLOW}✗${RESET} $f → $LINK_TARGET (重复加载)"
-        FOUND_CONFLICT=1
+  done
+  if [[ -d "$backup_dir/etc" ]]; then
+    while IFS= read -r -d '' path; do
+      [[ "$path" == "$backup_dir$CONFIG_FILE" || "$path" == "$backup_dir$MODULE_FILE" ]] && continue
+      cp -a "$path" "${path#"$backup_dir"}"
+    done < <(find "$backup_dir/etc" -type f -print0)
+  fi
+  if [[ -r "$backup_dir/qdisc.iface" && -r "$backup_dir/qdisc.kind" ]] && command -v tc >/dev/null 2>&1; then
+    old_iface=$(<"$backup_dir/qdisc.iface")
+    old_kind=$(<"$backup_dir/qdisc.kind")
+    if [[ -d "/sys/class/net/$old_iface" ]]; then
+      if [[ "$old_kind" == noqueue || "$old_kind" == unknown ]]; then
+        tc qdisc del dev "$old_iface" root 2>/dev/null || true
+      else
+        tc qdisc replace dev "$old_iface" root "$old_kind" 2>/dev/null || true
+      fi
     fi
-done
+  fi
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  sysctl --system >/dev/null || true
+}
 
-if [ -f /etc/sysctl.conf ]; then
-    if grep -qE "$PATTERN" /etc/sysctl.conf 2>/dev/null; then
-        echo -e "  ${YELLOW}✗${RESET} /etc/sysctl.conf (将被清空)"
-        grep -nE "$PATTERN" /etc/sysctl.conf | while read line; do echo "      $line"; done
-        FOUND_CONFLICT=1
-    fi
+restore_latest() {
+  require_root
+  [[ -r "$BACKUP_ROOT/latest" ]] || die "没有可恢复的备份记录"
+  local backup_dir
+  backup_dir=$(<"$BACKUP_ROOT/latest")
+  [[ -d "$backup_dir" && "$backup_dir" == "$BACKUP_ROOT"/* ]] || die "备份记录无效"
+  confirm "恢复备份 $backup_dir？" || { info "已取消"; return; }
+  restore_from "$backup_dir"
+  ok "已恢复：$backup_dir"
+}
+
+uninstall_config() {
+  require_root
+  [[ -e "$CONFIG_FILE" || -e "$MODULE_FILE" || -e "$RUNTIME_FILE" || -e "$SERVICE_FILE" ]] || { info "未发现本工具配置"; return; }
+  confirm "删除本工具生成的配置？旧的冲突配置不会自动恢复。" || { info "已取消"; return; }
+  if command -v systemctl >/dev/null 2>&1; then systemctl disable --now tcp-tune-runtime.service >/dev/null 2>&1 || true; fi
+  rm -f "$CONFIG_FILE" "$MODULE_FILE" "$RUNTIME_FILE" "$SERVICE_FILE"
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+  sysctl --system >/dev/null || true
+  ok "已删除本工具配置；备份仍保留在 $BACKUP_ROOT"
+}
+
+status() {
+  say "${C_BOLD}TCP 当前状态${C_RESET}"
+  printf '  %-18s %s\n' "内核" "$(uname -r)"
+  printf '  %-18s %s\n' "拥塞控制" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || say unavailable)"
+  printf '  %-18s %s\n' "可用算法" "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || say unavailable)"
+  printf '  %-18s %s\n' "默认 qdisc" "$(sysctl -n net.core.default_qdisc 2>/dev/null || say unavailable)"
+  printf '  %-18s %s\n' "rmem_max" "$(sysctl -n net.core.rmem_max 2>/dev/null || say unavailable)"
+  printf '  %-18s %s\n' "wmem_max" "$(sysctl -n net.core.wmem_max 2>/dev/null || say unavailable)"
+  if command -v ip >/dev/null 2>&1 && command -v tc >/dev/null 2>&1; then
+    local status_iface
+    status_iface=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    [[ -n "$status_iface" ]] && printf '  %-18s %s\n' "实际 qdisc" "$(tc qdisc show dev "$status_iface" 2>/dev/null | awk '$0 ~ / root / {print; exit}')"
+  fi
+  [[ -f "$CONFIG_FILE" ]] && ok "已安装 $CONFIG_FILE" || info "尚未安装本工具配置"
+}
+
+main() {
+  parse_args "$@"
+  require_linux
+  [[ -n "$MEMORY_MIB" ]] || MEMORY_MIB=$(detect_memory_mib)
+  case "$ACTION" in
+    wizard) wizard ;;
+    preview|apply)
+      [[ -n "$LOCAL_MBPS" && -n "$SERVER_MBPS" && -n "$RTT_MS" ]] || die "preview/apply 需要带宽与 RTT 参数；或使用 wizard"
+      validate_inputs; detect_interface; calculate
+      [[ "$ACTION" == preview ]] && preview_config || { preview_config; confirm "确认应用？" && apply_config || info "已取消"; }
+      ;;
+    status) status ;;
+    restore) restore_latest ;;
+    uninstall) uninstall_config ;;
+    "") [[ -t 0 ]] && main_menu || usage ;;
+    help|-h|--help) usage ;;
+    *) die "未知操作：$ACTION（使用 --help 查看帮助）" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+  main "$@"
 fi
-
-# 扫描系统默认值
-if [ -d /usr/lib/sysctl.d ]; then
-    for f in /usr/lib/sysctl.d/*.conf; do
-        [ ! -f "$f" ] && continue
-        if grep -qE "$PATTERN" "$f" 2>/dev/null; then
-            echo -e "  ${DIM}ℹ${RESET} $f (系统默认, 会被覆盖)"
-        fi
-    done
-fi
-
-if [ "$FOUND_CONFLICT" -eq 0 ]; then
-    ok "未发现冲突配置"
-else
-    echo -e "  ${YELLOW}→ 将在下一阶段自动备份并清理${RESET}"
-fi
-
-# ─── Phase 2 — 预览变更 ──────────────────────────────────────
-section "预览即将应用的优化" "3"
-
-# 计算分档
-if   [ "$MEM_MB" -le 512 ]; then
-    TIER="微型"
-    RMEM_MAX=8388608; WMEM_MAX=8388608
-    TCP_RMEM="4096 87380 8388608"; TCP_WMEM="4096 65536 8388608"
-    TCP_MEM="32768 43690 65536"; CONNTRACK_VAL=131072
-elif [ "$MEM_MB" -le 2048 ]; then
-    TIER="标准"
-    RMEM_MAX=33554432; WMEM_MAX=33554432
-    TCP_RMEM="4096 87380 33554432"; TCP_WMEM="4096 65536 33554432"
-    TCP_MEM="131072 174762 262144"; CONNTRACK_VAL=1000000
-elif [ "$MEM_MB" -le 8192 ]; then
-    TIER="高性能"
-    RMEM_MAX=67108864; WMEM_MAX=67108864
-    TCP_RMEM="4096 131072 67108864"; TCP_WMEM="4096 65536 67108864"
-    TCP_MEM="262144 349525 524288"; CONNTRACK_VAL=2000000
-else
-    TIER="旗舰"
-    RMEM_MAX=134217728; WMEM_MAX=134217728
-    TCP_RMEM="4096 131072 134217728"; TCP_WMEM="4096 65536 134217728"
-    TCP_MEM="524288 699050 1048576"; CONNTRACK_VAL=4000000
-fi
-
-if [ "$HAS_BBR" -eq 1 ]; then
-    CC_ALGO="bbr"; QDISC="fq"
-else
-    CC_ALGO="cubic"; QDISC="fq_codel"
-fi
-
-# 获取当前值供对比
-CUR_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "N/A")
-CUR_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "N/A")
-
-echo -e "  ${BOLD}档位${RESET}        $TIER (${MEM_MB}MB 内存)"
-echo -e "  ${BOLD}拥塞控制${RESET}    ${CUR_CC} ${DIM}→${RESET} ${CC_ALGO}"
-echo -e "  ${BOLD}队列算法${RESET}    ${CUR_QDISC} ${DIM}→${RESET} ${QDISC}"
-echo -e "  ${BOLD}缓冲区${RESET}      $((RMEM_MAX/1048576))MB"
-echo -e "  ${BOLD}冲突处理${RESET}    $( [ "$FOUND_CONFLICT" -eq 1 ] && echo "备份 ${#CONFLICT_FILES[@]} 个冲突文件" || echo "无冲突需处理" )"
-echo -e "  ${BOLD}目标文件${RESET}    $CONF_FILE"
-
-# BBR 不可用时的特殊段落
-if [ "$HAS_BBR" -eq 0 ] && [ -n "$BBR_HINT" ]; then
-    echo ""
-    warn "BBR 不可用, 将使用 cubic + fq_codel 替代"
-    echo -e "  ${DIM}原因: ${BBR_HINT}${RESET}"
-fi
-
-# ─── 确认/退出环节 ────────────────────────────────────────────
-echo ""
-if [ "$DRY_RUN" -eq 1 ]; then
-    box "$YELLOW" \
-        "预览模式 (Dry-Run)" \
-        "" \
-        "本次未写入任何配置, 可安全重复运行" \
-        "" \
-        "确认无误后执行:" \
-        "  bash tcp-tune.sh -y      # 直接应用" \
-        "  bash tcp-tune.sh         # 交互式应用"
-    exit 0
-fi
-
-if [ "$ASSUME_YES" != "1" ]; then
-    echo -ne " ${BOLD}应用以上优化? [Y/n]${RESET} "
-    read -r REPLY < /dev/tty
-    case "$REPLY" in
-        [Nn][Oo]|[Nn])
-            echo ""
-            info "已取消, 未作任何修改"
-            exit 0
-            ;;
-    esac
-else
-    info "非交互模式, 自动应用..."
-fi
-
-# ─── Phase 3 — 执行变更 ──────────────────────────────────────
-echo ""
-section "正在应用优化" "4"
-
-NEED_CLEANUP=0
-
-# 3a. 清理冲突
-if [ "$FOUND_CONFLICT" -eq 1 ]; then
-    mkdir -p "$BACKUP_DIR"
-    for f in /etc/sysctl.d/*.conf; do
-        [ ! -f "$f" ] && continue
-        [ "$(basename "$f")" = "$(basename "$CONF_FILE")" ] && continue
-        if [ -L "$f" ]; then
-            LINK_TARGET=$(readlink "$f" 2>/dev/null || true)
-            if echo "$LINK_TARGET" | grep -qE "sysctl\.conf"; then
-                rm "$f" && ok "已删除符号链接: $f" && NEED_CLEANUP=1
-            fi
-        elif grep -qE "$PATTERN" "$f" 2>/dev/null; then
-            cp "$f" "$BACKUP_DIR/" && rm "$f"
-            ok "已备份并移除: $f" && NEED_CLEANUP=1
-        fi
-    done
-    if [ -f /etc/sysctl.conf ] && grep -qE "$PATTERN" /etc/sysctl.conf 2>/dev/null; then
-        cp /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf" 2>/dev/null || true
-        echo "# Cleared by tcp-tune.sh v2.5 — see ${CONF_FILE}" > /etc/sysctl.conf
-        ok "已清空 /etc/sysctl.conf" && NEED_CLEANUP=1
-    fi
-fi
-
-if [ "$NEED_CLEANUP" -eq 0 ]; then
-    info "无需清理冲突"
-fi
-
-# 3b. 写入配置
-cat > "$CONF_FILE" << EOF
-# ════════════════════════════════════════════
-#   TCP 深度调优 - $HOSTNAME
-#   档位: $TIER (${MEM_MB}MB) | $(date '+%Y-%m-%d %H:%M:%S')
-#   由 tcp-tune.sh v2.5 自动生成
-# ════════════════════════════════════════════
-
-# ── TIME_WAIT ──────────────────────────────
-net.ipv4.tcp_tw_reuse           = 1
-net.ipv4.tcp_max_tw_buckets     = 20000
-
-# ── 连接保活 ───────────────────────────────
-net.ipv4.tcp_keepalive_time     = 120
-net.ipv4.tcp_keepalive_intvl    = 10
-net.ipv4.tcp_keepalive_probes   = 6
-
-# ── SYN 握手 ───────────────────────────────
-net.ipv4.tcp_syncookies         = 1
-net.ipv4.tcp_syn_retries        = 3
-net.ipv4.tcp_synack_retries     = 3
-net.ipv4.tcp_max_syn_backlog    = 8192
-net.core.somaxconn              = 8192
-
-# ── 端口范围 ───────────────────────────────
-net.ipv4.ip_local_port_range    = 1024 65535
-
-# ── MTU 探测 ───────────────────────────────
-net.ipv4.tcp_mtu_probing        = 1
-
-# ── 内存与缓冲区 [$TIER] ───────────────────
-net.core.rmem_default           = 262144
-net.core.wmem_default           = 262144
-net.core.rmem_max               = $RMEM_MAX
-net.core.wmem_max               = $WMEM_MAX
-net.ipv4.tcp_rmem               = $TCP_RMEM
-net.ipv4.tcp_wmem               = $TCP_WMEM
-net.ipv4.tcp_mem                = $TCP_MEM
-
-# ── 连接队列/网卡接收队列 ──────────────────
-net.core.netdev_max_backlog     = 10000
-
-# ── TCP 选项 ───────────────────────────────
-net.ipv4.tcp_fastopen           = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_sack               = 1
-net.ipv4.tcp_timestamps         = 1
-net.ipv4.tcp_window_scaling     = 1
-net.ipv4.tcp_no_metrics_save    = 1
-
-# ── 尾部延迟 ───────────────────────────────
-net.ipv4.tcp_notsent_lowat      = 131072
-
-# ── 快速回收 ───────────────────────────────
-net.ipv4.tcp_fin_timeout        = 30
-
-# ── TIME_WAIT 暗杀防护 ─────────────────────
-net.ipv4.tcp_rfc1337            = 1
-
-# ── 死连接检测 ─────────────────────────────
-net.ipv4.tcp_retries2           = 8
-
-# ── TCP 选项内存 ───────────────────────────
-net.core.optmem_max             = 65536
-
-# ── 文件描述符 ─────────────────────────────
-fs.file-max                     = 1000000
-
-# ── 拥塞控制 ───────────────────────────────
-net.core.default_qdisc          = $QDISC
-net.ipv4.tcp_congestion_control = $CC_ALGO
-
-# ── 内存交换 ───────────────────────────────
-vm.swappiness                  = 1
-EOF
-ok "配置已写入: $CONF_FILE"
-
-# conntrack 补充
-if [ "$HAS_CONNTRACK" -eq 1 ]; then
-    cat >> "$CONF_FILE" << EOF
-
-# ── 连接追踪表 ─────────────────────────────
-net.netfilter.nf_conntrack_max = $CONNTRACK_VAL
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-EOF
-    info "已追加 conntrack 配置"
-fi
-
-# 3c. 生效
-if sysctl -p "$CONF_FILE" > /dev/null 2>&1; then
-    ok "配置已生效 (sysctl -p)"
-else
-    warn "部分参数生效失败, 请检查 $CONF_FILE 语法"
-fi
-
-# 3d. RPS/XPS (多核优化)
-if [ "$CPU_CORES" -gt 1 ] && [ -n "$MAIN_IFACE" ]; then
-    CPU_MASK=$(printf "%x" $(( (1 << CPU_CORES) - 1 )))
-    for rxq in /sys/class/net/$MAIN_IFACE/queues/rx-*/rps_cpus; do
-        echo "$CPU_MASK" > "$rxq" 2>/dev/null || true
-    done
-    for txq in /sys/class/net/$MAIN_IFACE/queues/tx-*/xps_cpus; do
-        echo "$CPU_MASK" > "$txq" 2>/dev/null || true
-    done
-    ok "RPS/XPS 已设置 (掩码: $CPU_MASK)"
-else
-    info "单核, 跳过 RPS/XPS"
-fi
-
-# ─── Phase 4 — 验证 ──────────────────────────────────────────
-section "验证关键参数" "5"
-
-verify() { sysctl -n "$1" 2>/dev/null || echo "N/A"; }
-
-echo ""
-printf "  ${DIM}%-38s %s${RESET}\n" "参数" "当前值"
-printf "  ${DIM}%-38s %s${RESET}\n" "──────────────────────────────────────" "────────────────"
-echo -e "  ${BOLD}tcp_congestion_control${RESET}         $(verify net.ipv4.tcp_congestion_control)"
-echo -e "  default_qdisc                  $(verify net.core.default_qdisc)"
-echo -e "  rmem_max / wmem_max            $(verify net.core.rmem_max) / $(verify net.core.wmem_max)"
-echo -e "  tcp_rmem (min def max)         $(verify net.ipv4.tcp_rmem)"
-echo -e "  tcp_wmem (min def max)         $(verify net.ipv4.tcp_wmem)"
-echo -e "  tcp_mem (min pressure max)     $(verify net.ipv4.tcp_mem)"
-echo -e "  somaxconn / tcp_max_syn_backlog $(verify net.core.somaxconn) / $(verify net.ipv4.tcp_max_syn_backlog)"
-echo -e "  netdev_max_backlog             $(verify net.core.netdev_max_backlog)"
-echo -e "  ip_local_port_range            $(verify net.ipv4.ip_local_port_range)"
-echo -e "  tcp_fastopen                   $(verify net.ipv4.tcp_fastopen)"
-echo -e "  tcp_keepalive (t/i/p)          $(verify net.ipv4.tcp_keepalive_time) / $(verify net.ipv4.tcp_keepalive_intvl) / $(verify net.ipv4.tcp_keepalive_probes)"
-echo -e "  tcp_fin_timeout                $(verify net.ipv4.tcp_fin_timeout)"
-echo -e "  tcp_retries2                   $(verify net.ipv4.tcp_retries2)"
-echo -e "  tcp_notsent_lowat              $(verify net.ipv4.tcp_notsent_lowat)"
-echo -e "  tcp_no_metrics_save            $(verify net.ipv4.tcp_no_metrics_save)"
-echo -e "  vm.swappiness                  $(verify vm.swappiness)"
-[ "$HAS_CONNTRACK" -eq 1 ] && \
-    echo -e "  nf_conntrack_max               $(verify net.netfilter.nf_conntrack_max)"
-
-# ─── 完成 ──────────────────────────────────────────────────────
-echo ""
-box "$GREEN" \
-    "TCP 调优完成!" \
-    "" \
-    "  主机:   ${HOSTNAME}" \
-    "  档位:   ${TIER}  (${MEM_MB}MB)" \
-    "  拥塞:   ${CC_ALGO}  |  队列: ${QDISC}" \
-    "  缓冲:   $((RMEM_MAX/1048576))MB"
-
-if [ "$HAS_BBR" -eq 0 ] && [ -n "$BBR_HINT" ]; then
-    warn "BBR 未启用 — ${BBR_HINT}"
-fi
-
-if [ "$NEED_CLEANUP" -eq 1 ]; then
-    echo ""
-    info "回滚命令 (如有需要):"
-    echo ""
-    echo -e "  ${DIM}# 恢复备份的冲突文件${RESET}"
-    echo "  cp -r ${BACKUP_DIR}/* /etc/sysctl.d/"
-    echo ""
-    echo -e "  ${DIM}# 删除本脚本生成的配置${RESET}"
-    echo "  rm -f ${CONF_FILE}"
-    echo "  sysctl --system"
-    echo ""
-fi
-
-echo -e " ${GREEN}✔${RESET} 完成! 配置已生效"
-echo ""
