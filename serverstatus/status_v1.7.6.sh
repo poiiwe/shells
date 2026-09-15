@@ -1,44 +1,14 @@
 #!/usr/bin/env bash
-
-DEFAULT_INTERVAL=1
-
-
-# v1.7.4 输入安全检查
-# 检测命令行 URL 中可能被 Shell 处理的特殊字符
-function check_shell_special_chars() {
-
-    local input="$1"
-
-    if [[ "$input" =~ [\$\*\`\;\&\|\<\>\(\)] ]]; then
-
-        echo
-        echo -e "${Warning} 检测到 URL 中包含 Shell 特殊字符"
-        echo
-        echo "可能影响字符:"
-        echo "  \$  变量展开"
-        echo "  *  通配符展开"
-        echo "  \` 命令替换"
-        echo "  ; & | 命令连接符"
-        echo
-        echo "建议:"
-        echo "1. 使用单引号包裹完整 URL:"
-        echo
-        echo "bash status.sh -i -c 'https://user:password@example.com'"
-        echo
-        echo "2. 或使用交互模式:"
-        echo
-        echo "bash status.sh -i -c"
-        echo
-
-        safe_input_fallback
-    fi
-}
-
-#!/usr/bin/env bash
 #=================================================
 #  Description: ServerStatus-Rust 管理脚本
-#  Script Version: v1.7.8.1
+#  Script Version: v1.7.6
 #  Updater: Yooona-Lim
+#
+#  v1.7.6:
+#    1. 修复脚本入口、版本标记、恢复回滚和 URI 校验
+#    2. 缩小依赖检查与互斥锁范围，避免只读操作安装软件或长期占锁
+#    3. Client unit 改为仅 root 可读，降低凭据泄露风险
+#    4. 全量备份与恢复使用同一快照，下载固定发布版本
 #
 #  v1.7.0:
 #    1. 重构安装、配置、升级、备份和恢复流程
@@ -54,7 +24,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 022
 
-SCRIPT_VERSION="v1.7.9"
+readonly SCRIPT_VERSION="v1.7.6"
 REPO="zdz/ServerStatus-Rust"
 WORKING_DIR="/opt/ServerStatus"
 CLIENT_DIR="${WORKING_DIR}/client"
@@ -80,6 +50,7 @@ LOCK_DIR=""
 RELEASE_VERSION="unknown"
 ARCH=""
 PKG_FAMILY=""
+BACKUP_STAMP=""
 
 CLIENT_PROTOCOL=""
 CLIENT_HOST=""
@@ -88,10 +59,10 @@ CLIENT_PATH=""
 CLIENT_USER=""
 CLIENT_PASSWORD=""
 
-log_info()    { echo -e "${INFO} $*"; }
-log_warn()    { echo -e "${WARNING} $*" >&2; }
-log_error()   { echo -e "${ERROR} $*" >&2; }
-log_success() { echo -e "${SUCCESS} $*"; }
+log_info()    { printf '%b %s\n' "$INFO" "$*"; }
+log_warn()    { printf '%b %s\n' "$WARNING" "$*" >&2; }
+log_error()   { printf '%b %s\n' "$ERROR" "$*" >&2; }
+log_success() { printf '%b %s\n' "$SUCCESS" "$*"; }
 die()         { log_error "$*"; exit 1; }
 
 cleanup() {
@@ -163,14 +134,18 @@ detect_package_family() {
 }
 
 install_dependencies() {
+    local profile=${1:-download}
     local need=()
-    command -v unzip >/dev/null 2>&1 || need+=(unzip)
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-        need+=(curl)
+    if [[ "$profile" == "download" ]]; then
+        command -v unzip >/dev/null 2>&1 || need+=(unzip)
+        if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+            need+=(curl)
+        fi
     fi
     command -v base64 >/dev/null 2>&1 || need+=(coreutils)
     ((${#need[@]} == 0)) && return 0
 
+    detect_package_family
     log_info "安装依赖：${need[*]}"
     case "$PKG_FAMILY" in
         deb)
@@ -179,27 +154,34 @@ install_dependencies() {
             ;;
         dnf) dnf install -y ca-certificates "${need[@]}" ;;
         yum) yum install -y ca-certificates "${need[@]}" ;;
-        arch)
-            local arch_need=()
-            for item in "${need[@]}"; do
-                [[ "$item" == "coreutils" ]] || arch_need+=("$item")
-            done
-            ((${#arch_need[@]})) && pacman -Sy --noconfirm "${arch_need[@]}"
-            ;;
+        arch) pacman -Sy --noconfirm ca-certificates "${need[@]}" ;;
         alpine)
             apk add --no-cache ca-certificates "${need[@]}"
             ;;
     esac
 }
 
-preflight() {
+preflight_mutating() {
+    local profile=${1:-none}
     require_root
     require_systemd
     acquire_lock
-    check_arch
-    detect_package_family
-    install_dependencies
     init_tmp
+    case "$profile" in
+        download)
+            check_arch
+            install_dependencies download
+            ;;
+        config)
+            install_dependencies config
+            ;;
+        none) ;;
+        *) die "未知的环境检查类型：${profile}" ;;
+    esac
+}
+
+preflight_readonly() {
+    require_systemd
 }
 
 fetch_text() {
@@ -246,10 +228,14 @@ verify_elf() {
 }
 
 download_component() {
-    local component=$1 target zip extract_dir binary asset url found
+    local component=$1 version=${2:-unknown} target zip extract_dir binary asset url found
     target=$(asset_arch)
     asset="${component}-${target}.zip"
-    url="https://github.com/${REPO}/releases/latest/download/${asset}"
+    if [[ -n "$version" && "$version" != "unknown" ]]; then
+        url="https://github.com/${REPO}/releases/download/${version}/${asset}"
+    else
+        url="https://github.com/${REPO}/releases/latest/download/${asset}"
+    fi
     zip="${TMP_DIR}/${asset}"
     extract_dir="${TMP_DIR}/${component}"
 
@@ -274,8 +260,9 @@ download_component() {
 
 validate_no_control_chars() {
     local label=$1 value=$2
-    [[ "$value" != *$'\n'* && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || \
-        die "${label} 不能包含换行符、回车符或制表符。"
+    if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+        die "${label} 不能包含控制字符。"
+    fi
 }
 
 url_decode() {
@@ -304,7 +291,7 @@ b64_encode() {
 b64_decode() {
     local value=$1
     [[ -n "$value" ]] || return 0
-    printf '%s' "$value" | base64 -d 2>/dev/null || true
+    printf '%s' "$value" | base64 -d 2>/dev/null
 }
 
 default_port_for_protocol() {
@@ -341,7 +328,10 @@ validate_client_config() {
     validate_no_control_chars "服务器地址" "$CLIENT_HOST"
     validate_no_control_chars "上报路径" "$CLIENT_PATH"
 
-    [[ "$CLIENT_HOST" != *'/'* && "$CLIENT_HOST" != *' '* ]] || die "服务器地址格式错误。"
+    [[ "$CLIENT_HOST" != *'/'* && "$CLIENT_HOST" != *' '* &&
+       "$CLIENT_HOST" != *'@'* && "$CLIENT_HOST" != *'#'* &&
+       "$CLIENT_HOST" != *'?'* && "$CLIENT_HOST" != *'['* &&
+       "$CLIENT_HOST" != *']'* ]] || die "服务器地址格式错误。"
 
     if [[ -n "$CLIENT_PORT" ]]; then
         [[ "$CLIENT_PORT" =~ ^[0-9]+$ ]] || die "端口必须是数字。"
@@ -407,7 +397,7 @@ parse_quick_uri() {
     fi
 
     if [[ "$target" == \[* ]]; then
-        if [[ "$target" =~ ^\[([^]]+)\](:([0-9]+))?(.*)$ ]]; then
+        if [[ "$target" =~ ^\[([^]]+)\](:([0-9]+))?(/.*)?$ ]]; then
             host=${BASH_REMATCH[1]}
             port=${BASH_REMATCH[3]}
             path=${BASH_REMATCH[4]}
@@ -502,28 +492,12 @@ interactive_client_config() {
     fi
 
     prompt_nonempty "请输入用户名" "${CLIENT_USER:-}" CLIENT_USER
-
-    if [[ -n "${CLIENT_PASSWORD:-}" ]]; then
-        echo "已有密码配置，直接回车将保持原密码。"
-        while true; do
-            read -r -s -p "请输入新密码（回车保持原密码）: " input_password
-            echo
-
-            if [[ -z "$input_password" ]]; then
-                break
-            fi
-
-            CLIENT_PASSWORD="$input_password"
-            break
-        done
-    else
-        while true; do
-            read -r -s -p "请输入密码（不会显示，特殊字符可直接输入）: " CLIENT_PASSWORD
-            echo
-            [[ -n "$CLIENT_PASSWORD" ]] && break
-            log_warn "密码不能为空。"
-        done
-    fi
+    while true; do
+        read -r -s -p "请输入密码（不会显示，特殊字符可直接输入）: " CLIENT_PASSWORD
+        echo
+        [[ -n "$CLIENT_PASSWORD" ]] && break
+        log_warn "密码不能为空。"
+    done
 
     validate_client_config
 
@@ -559,21 +533,13 @@ read_unit_metadata() {
     CLIENT_PORT=$(sed -n 's/^# STATUS_PORT=//p' "$CLIENT_UNIT" | head -n1)
 
     line=$(sed -n 's/^# STATUS_HOST_B64=//p' "$CLIENT_UNIT" | head -n1)
-    CLIENT_HOST=$(b64_decode "$line")
+    CLIENT_HOST=$(b64_decode "$line") || return 1
     line=$(sed -n 's/^# STATUS_PATH_B64=//p' "$CLIENT_UNIT" | head -n1)
-    CLIENT_PATH=$(b64_decode "$line")
+    CLIENT_PATH=$(b64_decode "$line") || return 1
     line=$(sed -n 's/^# STATUS_USER_B64=//p' "$CLIENT_UNIT" | head -n1)
-    CLIENT_USER=$(b64_decode "$line")
-
-    # 从现有 systemd ExecStart 中读取密码
-    # 仅用于 -rc 保留密码，不单独保存密码文件
-    if [[ -z "${CLIENT_PASSWORD:-}" ]]; then
-        CLIENT_PASSWORD=$(sed -n 's/.* -p "\([^"]*\)".*/\1/p' "$CLIENT_UNIT" | head -n1)
-    fi
-
-    CLIENT_INTERVAL=$(sed -n 's/^# STATUS_INTERVAL=//p' "$CLIENT_UNIT" | head -n1)
-    [[ -n "$CLIENT_INTERVAL" ]] || CLIENT_INTERVAL="$DEFAULT_INTERVAL"
-
+    CLIENT_USER=$(b64_decode "$line") || return 1
+    case "$CLIENT_PROTOCOL" in http|https|grpc|grpcs) ;; *) return 1 ;; esac
+    [[ -n "$CLIENT_HOST" && -n "$CLIENT_USER" ]] || return 1
     return 0
 }
 
@@ -596,14 +562,12 @@ verify_unit_file() {
 
 write_client_unit_to() {
     local destination=$1 release=${2:-unknown}
-    local endpoint exec_binary exec_endpoint exec_user exec_password exec_interval
-    CLIENT_INTERVAL="${CLIENT_INTERVAL:-$DEFAULT_INTERVAL}"
+    local endpoint exec_binary exec_endpoint exec_user exec_password
     endpoint=$(build_endpoint)
     exec_binary=$(systemd_quote_arg "$CLIENT_FILE")
     exec_endpoint=$(systemd_quote_arg "$endpoint")
     exec_user=$(systemd_quote_arg "$CLIENT_USER")
     exec_password=$(systemd_quote_arg "$CLIENT_PASSWORD")
-    exec_interval=$(systemd_quote_arg "$CLIENT_INTERVAL")
 
     cat >"$destination" <<EOF
 # ScriptVersion=${SCRIPT_VERSION}
@@ -613,7 +577,6 @@ write_client_unit_to() {
 # STATUS_HOST_B64=$(b64_encode "$CLIENT_HOST")
 # STATUS_PATH_B64=$(b64_encode "$CLIENT_PATH")
 # STATUS_USER_B64=$(b64_encode "$CLIENT_USER")
-# STATUS_INTERVAL=${CLIENT_INTERVAL}
 [Unit]
 Description=ServerStatus-Rust Client
 Documentation=https://github.com/${REPO}
@@ -628,7 +591,7 @@ User=root
 Group=root
 Environment="RUST_BACKTRACE=1"
 WorkingDirectory=${CLIENT_DIR}
-ExecStart=${exec_binary} -a ${exec_endpoint} -u ${exec_user} -p ${exec_password} --interval ${exec_interval}
+ExecStart=${exec_binary} -a ${exec_endpoint} -u ${exec_user} -p ${exec_password}
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
@@ -636,7 +599,8 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 0644 "$destination"
+    # ExecStart 必须携带 Client 密码时，避免普通用户直接读取 unit。
+    chmod 0600 "$destination"
 }
 
 write_server_unit_to() {
@@ -659,6 +623,7 @@ WorkingDirectory=${SERVER_DIR}
 ExecStart=${SERVER_FILE} -c ${SERVER_TOML}
 Restart=on-failure
 RestartSec=5s
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -674,26 +639,40 @@ show_service_failure() {
 }
 
 start_and_check() {
-    local service=$1
+    local service=$1 enable_service=${2:-false} attempt
     systemctl daemon-reload
-    systemctl enable "$service" >/dev/null
+    if [[ "$enable_service" == "true" ]]; then
+        systemctl enable "$service" >/dev/null
+    fi
     systemctl restart "$service"
-    sleep 2
-    systemctl is-active --quiet "$service" || { show_service_failure "$service"; return 1; }
+    for attempt in 1 2 3; do
+        sleep 1
+        systemctl is-active --quiet "$service" || {
+            show_service_failure "$service"
+            return 1
+        }
+    done
 }
 
 atomic_install_unit() {
     local generated="$1"
     local target="$2"
     local service="$3"
+    local enable_service=${4:-false}
     local backup
+    local was_enabled=false
 
     backup="${TMP_DIR}/$(basename "$target").previous"
 
+    systemctl is-enabled --quiet "$service" 2>/dev/null && was_enabled=true
     [[ -f "$target" ]] && cp -a "$target" "$backup"
-    install -m 0644 "$generated" "$target"
+    if [[ "$service" == "$CLIENT_SERVICE" ]]; then
+        install -m 0600 "$generated" "$target"
+    else
+        install -m 0644 "$generated" "$target"
+    fi
 
-    if ! start_and_check "$service"; then
+    if ! start_and_check "$service" "$enable_service"; then
         log_warn "新配置启动失败，正在回滚 systemd 配置。"
         if [[ -f "$backup" ]]; then
             install -m 0644 "$backup" "$target"
@@ -701,38 +680,30 @@ atomic_install_unit() {
             rm -f "$target"
         fi
         systemctl daemon-reload
+        if ! $was_enabled && [[ "$enable_service" == "true" ]]; then
+            systemctl disable "$service" >/dev/null 2>&1 || true
+        fi
         systemctl restart "$service" 2>/dev/null || true
         return 1
-    fi
-}
-
-install_binary_with_rollback() {
-    local source=$1 target=$2 service=${3:-} backup="${TMP_DIR}/$(basename "$target").previous"
-    mkdir -p "$(dirname "$target")"
-    [[ -f "$target" ]] && cp -a "$target" "$backup"
-    install -m 0755 "$source" "$target"
-
-    if [[ -n "$service" ]] && systemctl list-unit-files "$service" >/dev/null 2>&1; then
-        if ! start_and_check "$service"; then
-            log_warn "新二进制启动失败，正在回滚。"
-            [[ -f "$backup" ]] && install -m 0755 "$backup" "$target"
-            systemctl restart "$service" 2>/dev/null || true
-            return 1
-        fi
     fi
 }
 
 install_client() {
     local quick_uri=${1:-} generated binary_backup="${TMP_DIR}/stat_client.previous" had_binary=false
     progress 1 6 "检查系统环境"
-    [[ -n "$quick_uri" ]] && { check_shell_special_chars "$quick_uri"; parse_quick_uri "$quick_uri"; } || interactive_client_config
+    if [[ -n "$quick_uri" ]]; then
+        log_warn "命令行 URI 可能保存在 Shell 历史和进程列表中；长期使用建议选择交互模式。"
+        parse_quick_uri "$quick_uri"
+    else
+        interactive_client_config
+    fi
 
     progress 2 6 "获取最新发布版本"
     RELEASE_VERSION=$(get_latest_version)
     log_info "目标版本：${RELEASE_VERSION}"
 
     progress 3 6 "下载并校验 Client"
-    download_component client
+    download_component client "$RELEASE_VERSION"
 
     progress 4 6 "安装 Client 二进制"
     mkdir -p "$CLIENT_DIR"
@@ -751,12 +722,13 @@ install_client() {
     fi
 
     progress 6 6 "启动 Client 并检查状态"
-    if ! atomic_install_unit "$generated" "$CLIENT_UNIT" "$CLIENT_SERVICE"; then
+    if ! atomic_install_unit "$generated" "$CLIENT_UNIT" "$CLIENT_SERVICE" true; then
         $had_binary && install -m 0755 "$binary_backup" "$CLIENT_FILE" || rm -f "$CLIENT_FILE"
         systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
         die "Client 安装失败，原二进制和配置已回滚。"
     fi
 
+    unset CLIENT_PASSWORD
     log_success "ServerStatus Client 安装完成。"
     echo "上报地址：$(build_endpoint)"
     echo "查看状态：systemctl status ${CLIENT_SERVICE}"
@@ -771,7 +743,7 @@ install_server() {
     log_info "目标版本：${RELEASE_VERSION}"
 
     progress 3 5 "下载并校验 Server"
-    download_component server
+    download_component server "$RELEASE_VERSION"
 
     progress 4 5 "安装 Server 文件"
     mkdir -p "$SERVER_DIR"
@@ -799,7 +771,7 @@ install_server() {
         $config_created && rm -f "$SERVER_TOML"
         die "systemd unit 校验失败，Server 文件已回滚。"
     fi
-    if ! atomic_install_unit "$generated" "$SERVER_UNIT" "$SERVER_SERVICE"; then
+    if ! atomic_install_unit "$generated" "$SERVER_UNIT" "$SERVER_SERVICE" true; then
         $had_binary && install -m 0755 "$binary_backup" "$SERVER_FILE" || rm -f "$SERVER_FILE"
         $config_created && rm -f "$SERVER_TOML"
         systemctl restart "$SERVER_SERVICE" 2>/dev/null || true
@@ -814,6 +786,7 @@ reconfigure_client() {
     [[ -x "$CLIENT_FILE" ]] || die "尚未安装 Client：${CLIENT_FILE}"
 
     if [[ -n "$quick_uri" ]]; then
+        log_warn "命令行 URI 可能保存在 Shell 历史和进程列表中；长期使用建议选择交互模式。"
         parse_quick_uri "$quick_uri"
     else
         if read_unit_metadata; then
@@ -835,14 +808,15 @@ reconfigure_client() {
     write_client_unit_to "$generated" "$release"
     verify_unit_file "$generated"
     atomic_install_unit "$generated" "$CLIENT_UNIT" "$CLIENT_SERVICE" || die "重新配置失败，原配置已回滚。"
+    unset CLIENT_PASSWORD
     log_success "Client 配置已更新。"
 }
 
 upgrade_component() {
-    local component=$1 binary unit service current latest backup
+    local component=$1 binary unit service current latest backup unit_backup="" unit_mode=0644
     case "$component" in
         client)
-            binary=$CLIENT_FILE; unit=$CLIENT_UNIT; service=$CLIENT_SERVICE ;;
+            binary=$CLIENT_FILE; unit=$CLIENT_UNIT; service=$CLIENT_SERVICE; unit_mode=0600 ;;
         server)
             binary=$SERVER_FILE; unit=$SERVER_UNIT; service=$SERVER_SERVICE ;;
         *) die "未知组件：$component" ;;
@@ -859,22 +833,25 @@ upgrade_component() {
         return
     fi
 
-    download_component "$component"
+    download_component "$component" "$latest"
     backup="${TMP_DIR}/${component}.previous"
     cp -a "$binary" "$backup"
+    if [[ -f "$unit" ]]; then
+        unit_backup="${TMP_DIR}/$(basename "$unit").previous"
+        cp -a "$unit" "$unit_backup"
+    fi
     systemctl stop "$service" 2>/dev/null || true
     install -m 0755 "$DOWNLOADED_BINARY" "$binary"
 
-    if [[ "$component" == "client" ]]; then
-        [[ -f "$unit" ]] && sed -i "s/^# ReleaseVersion=.*/# ReleaseVersion=${latest}/" "$unit"
-    else
-        [[ -f "$unit" ]] && sed -i "s/^# ReleaseVersion=.*/# ReleaseVersion=${latest}/" "$unit"
+    if [[ -f "$unit" ]]; then
+        sed -i "s/^# ReleaseVersion=.*/# ReleaseVersion=${latest}/" "$unit"
+        chmod "$unit_mode" "$unit"
     fi
 
     if ! start_and_check "$service"; then
         log_warn "升级后启动失败，正在恢复旧二进制。"
         install -m 0755 "$backup" "$binary"
-        [[ -f "$unit" ]] && sed -i "s/^# ReleaseVersion=.*/# ReleaseVersion=${current:-unknown}/" "$unit"
+        [[ -n "$unit_backup" ]] && cp -a "$unit_backup" "$unit"
         systemctl daemon-reload
         systemctl restart "$service" 2>/dev/null || true
         die "升级失败，已尝试回滚。"
@@ -884,20 +861,27 @@ upgrade_component() {
 
 backup_component() {
     local component=$1 stamp destination
-    stamp=$(date '+%Y%m%d-%H%M%S')
+    stamp=${BACKUP_STAMP:-$(date '+%Y%m%d-%H%M%S')}
     destination="${BACKUP_ROOT}/${stamp}/${component}"
-    mkdir -p "$destination"
-    chmod 700 "${BACKUP_ROOT}/${stamp}"
 
     case "$component" in
         client)
-            [[ -f "$CLIENT_FILE" ]] && cp -a "$CLIENT_FILE" "$destination/"
-            [[ -f "$CLIENT_UNIT" ]] && cp -a "$CLIENT_UNIT" "$destination/"
+            [[ -f "$CLIENT_FILE" && -f "$CLIENT_UNIT" ]] || die "Client 未安装或文件不完整，无法备份。"
             ;;
         server)
-            [[ -f "$SERVER_FILE" ]] && cp -a "$SERVER_FILE" "$destination/"
-            [[ -f "$SERVER_TOML" ]] && cp -a "$SERVER_TOML" "$destination/"
-            [[ -f "$SERVER_UNIT" ]] && cp -a "$SERVER_UNIT" "$destination/"
+            [[ -f "$SERVER_FILE" && -f "$SERVER_TOML" && -f "$SERVER_UNIT" ]] || \
+                die "Server 未安装或文件不完整，无法备份。"
+            ;;
+    esac
+
+    mkdir -p "$destination"
+    chmod 700 "${BACKUP_ROOT}/${stamp}" "$destination"
+    case "$component" in
+        client)
+            cp -a "$CLIENT_FILE" "$CLIENT_UNIT" "$destination/"
+            ;;
+        server)
+            cp -a "$SERVER_FILE" "$SERVER_TOML" "$SERVER_UNIT" "$destination/"
             ;;
     esac
     log_success "${component} 已备份至：${destination}"
@@ -908,11 +892,22 @@ latest_backup_dir() {
     find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type d -name "$component" 2>/dev/null | sort | tail -n1
 }
 
+latest_combined_backup_root() {
+    local snapshot
+    while IFS= read -r snapshot; do
+        if [[ -d "$snapshot/client" && -d "$snapshot/server" ]]; then
+            printf '%s' "$snapshot"
+            return 0
+        fi
+    done < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r)
+    return 1
+}
+
 restore_component() {
-    local component=$1 source service rollback="${TMP_DIR}/restore-${component}" had_binary=false had_unit=false had_config=false
-    source=$(latest_backup_dir "$component")
+    local component=$1 source=${2:-} already_confirmed=${3:-false} service rollback="${TMP_DIR}/restore-${component}" had_binary=false had_unit=false had_config=false
+    [[ -n "$source" ]] || source=$(latest_backup_dir "$component")
     [[ -n "$source" && -d "$source" ]] || die "未找到 ${component} 备份。"
-    confirm_destructive "确认使用最近备份恢复 ${component} 吗？"
+    [[ "$already_confirmed" == "true" ]] || confirm_destructive "确认使用最近备份恢复 ${component} 吗？"
     log_info "使用备份：${source}"
     mkdir -p "$rollback"
 
@@ -923,17 +918,18 @@ restore_component() {
             [[ -f "$CLIENT_UNIT" ]] && { cp -a "$CLIENT_UNIT" "$rollback/"; had_unit=true; }
             mkdir -p "$CLIENT_DIR"
             install -m 0755 "$source/stat_client" "$CLIENT_FILE"
-            install -m 0644 "$source/${CLIENT_SERVICE}" "$CLIENT_UNIT"
+            install -m 0600 "$source/${CLIENT_SERVICE}" "$CLIENT_UNIT"
             service=$CLIENT_SERVICE
             ;;
         server)
-            [[ -f "$source/stat_server" && -f "$source/${SERVER_SERVICE}" ]] || die "Server 备份不完整。"
+            [[ -f "$source/stat_server" && -f "$source/config.toml" && -f "$source/${SERVER_SERVICE}" ]] || \
+                die "Server 备份不完整。"
             [[ -f "$SERVER_FILE" ]] && { cp -a "$SERVER_FILE" "$rollback/"; had_binary=true; }
             [[ -f "$SERVER_UNIT" ]] && { cp -a "$SERVER_UNIT" "$rollback/"; had_unit=true; }
             [[ -f "$SERVER_TOML" ]] && { cp -a "$SERVER_TOML" "$rollback/"; had_config=true; }
             mkdir -p "$SERVER_DIR"
             install -m 0755 "$source/stat_server" "$SERVER_FILE"
-            [[ -f "$source/config.toml" ]] && install -m 0600 "$source/config.toml" "$SERVER_TOML"
+            install -m 0600 "$source/config.toml" "$SERVER_TOML"
             install -m 0644 "$source/${SERVER_SERVICE}" "$SERVER_UNIT"
             service=$SERVER_SERVICE
             ;;
@@ -949,7 +945,11 @@ restore_component() {
             server)
                 $had_binary && install -m 0755 "$rollback/stat_server" "$SERVER_FILE" || rm -f "$SERVER_FILE"
                 $had_unit && install -m 0644 "$rollback/${SERVER_SERVICE}" "$SERVER_UNIT" || rm -f "$SERVER_UNIT"
-                $had_config && install -m 0600 "$rollback/config.toml" "$SERVER_TOML" || true
+                if $had_config; then
+                    install -m 0600 "$rollback/config.toml" "$SERVER_TOML"
+                else
+                    rm -f -- "$SERVER_TOML"
+                fi
                 ;;
         esac
         systemctl daemon-reload
@@ -985,21 +985,6 @@ uninstall_component() {
     log_success "${component} 已卸载。"
 }
 
-
-change_interval() {
-    read_unit_metadata || die "无法读取当前 Client 配置。"
-    echo "当前上报间隔: ${CLIENT_INTERVAL:-1}s"
-    read -r -p "新的上报间隔(秒): " value
-    value=${value:-1}
-    [[ "$value" =~ ^[0-9]+$ ]] || die "interval 必须为数字"
-    (( value >= 1 && value <= 86400 )) || die "interval 范围 1-86400"
-    CLIENT_INTERVAL="$value"
-    local generated="${TMP_DIR}/${CLIENT_SERVICE}"
-    write_client_unit_to "$generated" "$(get_unit_release_version "$CLIENT_UNIT")"
-    atomic_install_unit "$generated" "$CLIENT_UNIT" "$CLIENT_SERVICE" || die "interval 修改失败"
-    log_success "上报间隔已修改为 ${CLIENT_INTERVAL}s"
-}
-
 manage_service() {
     local component=$1 action=$2 service
     [[ "$component" == "client" ]] && service=$CLIENT_SERVICE || service=$SERVER_SERVICE
@@ -1019,7 +1004,6 @@ show_client_config() {
         echo "端口：${CLIENT_PORT:-默认端口（service 中省略）}"
         echo "路径：${CLIENT_PATH:-无}"
         echo "用户：${CLIENT_USER}"
-        echo "上报间隔：${CLIENT_INTERVAL:-1}s"
         echo "完整上报地址：$(build_endpoint)"
         echo "密码：********"
     else
@@ -1033,12 +1017,7 @@ doctor() {
     echo "系统架构：$(uname -m)"
     echo "systemd：$(systemctl --version | head -n1)"
     echo
-    local components=(client server)
-    if [[ "${1:-}" == "client" || "${1:-}" == "server" ]]; then
-        components=("$1")
-    fi
-
-    for component in "${components[@]}"; do
+    for component in client server; do
         local service binary unit
         if [[ "$component" == client ]]; then
             service=$CLIENT_SERVICE; binary=$CLIENT_FILE; unit=$CLIENT_UNIT
@@ -1058,8 +1037,8 @@ doctor() {
 }
 
 show_help() {
+    printf 'ServerStatus-Rust 管理脚本 %s\n' "$SCRIPT_VERSION"
     cat <<'EOF'
-ServerStatus-Rust 管理脚本 ${SCRIPT_VERSION}
 
 用法：
   bash status.sh -i -c                     交互安装 Client
@@ -1093,7 +1072,7 @@ ServerStatus-Rust 管理脚本 ${SCRIPT_VERSION}
   3. HTTP(S) 未指定路径时自动使用 /report。
   4. 密码中的 @ 和 : 可直接输入，不需要手动写成 %40、%3A。
   5. 命令行中包含 $、空格、&、;、! 等 Shell 特殊字符时，请用单引号包住完整 URI。
-  6. 交互模式不会回显密码，是最稳妥的配置方式。
+  6. 交互模式不会回显密码，是最稳妥的配置方式；命令行 URI 可能进入历史和进程列表。
   7. 兼容旧版 %40 编码输入时可设置 DECODE_URI=true；默认不会擅自改写真实的 % 字符。
   8. 非交互执行卸载或恢复时，需要显式设置 YES=true。
 
@@ -1110,7 +1089,7 @@ setup_mirror() {
 }
 
 main() {
-    local command=${1:-help} sub=${2:-} arg=${3:-}
+    local command=${1:-help} sub=${2:-} arg=${3:-} action snapshot argc=$#
     setup_traps
     setup_mirror
 
@@ -1118,65 +1097,104 @@ main() {
         -h|--help|help) show_help; return ;;
     esac
 
-    preflight
+    ((argc <= 3)) || die "命令行参数过多，请使用 --help 查看用法。"
 
     case "$command" in
         -i|--install)
+            ((argc >= 2)) || die "安装参数不足，请使用 -i -c 或 -i -s。"
             case "$sub" in
-                -c|--client) install_client "$arg" ;;
-                -s|--server) install_server ;;
+                -c|--client) preflight_mutating download; install_client "$arg" ;;
+                -s|--server)
+                    [[ -z "$arg" ]] || die "安装 Server 不接受额外参数。"
+                    preflight_mutating download
+                    install_server
+                    ;;
                 *) die "安装参数错误，请使用 -i -c 或 -i -s。" ;;
             esac
             ;;
         -rc|--reconfig)
+            ((argc <= 2)) || die "重新配置参数过多。"
+            preflight_mutating config
             reconfigure_client "$sub"
             ;;
         -up|--upgrade)
+            ((argc == 2)) || die "升级操作需要且只接受一个组件参数。"
             case "$sub" in
-                -c|--client) upgrade_component client ;;
-                -s|--server) upgrade_component server ;;
-                -a|--all) upgrade_component server; upgrade_component client ;;
+                -c|--client) preflight_mutating download; upgrade_component client ;;
+                -s|--server) preflight_mutating download; upgrade_component server ;;
+                -a|--all) preflight_mutating download; upgrade_component server; upgrade_component client ;;
                 *) die "升级参数错误，请使用 -up -c、-up -s 或 -up -a。" ;;
             esac
             ;;
         -un|--uninstall)
+            ((argc == 2)) || die "卸载操作需要且只接受一个组件参数。"
             case "$sub" in
-                -c|--client) uninstall_component client ;;
-                -s|--server) uninstall_component server ;;
-                -a|--all) uninstall_component client; uninstall_component server ;;
+                -c|--client) preflight_mutating none; uninstall_component client ;;
+                -s|--server) preflight_mutating none; uninstall_component server ;;
+                -a|--all) preflight_mutating none; uninstall_component client; uninstall_component server ;;
                 *) die "卸载参数错误。" ;;
             esac
             ;;
         -b|--backup|--bakup)
+            ((argc == 2)) || die "备份操作需要且只接受一个组件参数。"
             case "$sub" in
-                -c|--client) backup_component client ;;
-                -s|--server) backup_component server ;;
-                -a|--all) backup_component server; backup_component client ;;
+                -c|--client) preflight_mutating none; backup_component client ;;
+                -s|--server) preflight_mutating none; backup_component server ;;
+                -a|--all)
+                    preflight_mutating none
+                    [[ -f "$CLIENT_FILE" && -f "$CLIENT_UNIT" &&
+                       -f "$SERVER_FILE" && -f "$SERVER_TOML" && -f "$SERVER_UNIT" ]] || \
+                        die "Client 或 Server 未安装完整，无法创建全量快照。"
+                    BACKUP_STAMP=$(date '+%Y%m%d-%H%M%S')
+                    backup_component server
+                    backup_component client
+                    ;;
                 *) die "备份参数错误。" ;;
             esac
             ;;
         -rs|--restore)
+            ((argc == 2)) || die "恢复操作需要且只接受一个组件参数。"
             case "$sub" in
-                -c|--client) restore_component client ;;
-                -s|--server) restore_component server ;;
-                -a|--all) restore_component server; restore_component client ;;
+                -c|--client) preflight_mutating none; restore_component client ;;
+                -s|--server) preflight_mutating none; restore_component server ;;
+                -a|--all)
+                    preflight_mutating none
+                    snapshot=$(latest_combined_backup_root) || die "未找到同时包含 Client 和 Server 的完整快照。"
+                    confirm_destructive "确认使用快照 $(basename "$snapshot") 恢复 Client 和 Server 吗？"
+                    restore_component server "$snapshot/server" true
+                    restore_component client "$snapshot/client" true
+                    ;;
                 *) die "恢复参数错误。" ;;
             esac
             ;;
         -c|--client)
-            manage_service client "${sub:-status}"
+            ((argc <= 2)) || die "Client 服务管理参数过多。"
+            action=${sub:-status}
+            case "$action" in
+                start|stop|restart) preflight_mutating none ;;
+                *) preflight_readonly ;;
+            esac
+            manage_service client "$action"
             ;;
         -s|--server)
-            manage_service server "${sub:-status}"
+            ((argc <= 2)) || die "Server 服务管理参数过多。"
+            action=${sub:-status}
+            case "$action" in
+                start|stop|restart) preflight_mutating none ;;
+                *) preflight_readonly ;;
+            esac
+            manage_service server "$action"
             ;;
         --show-config)
+            ((argc == 1)) || die "--show-config 不接受额外参数。"
+            require_root
+            preflight_readonly
+            command -v base64 >/dev/null 2>&1 || die "缺少 base64 命令。"
             show_client_config
             ;;
-
-        --change-interval)
-            change_interval
-            ;;
         --doctor)
+            ((argc == 1)) || die "--doctor 不接受额外参数。"
+            preflight_readonly
             doctor
             ;;
         *)
